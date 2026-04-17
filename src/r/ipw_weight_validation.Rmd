@@ -1,0 +1,845 @@
+---
+title: "IPW Weight Validation"
+subtitle: "Do the Stage 1 weights move the observed trend toward the true population trend?"
+author: "PlanningQueues / Model"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    highlight: tango
+    fig_width: 10
+    fig_height: 5
+    latex_engine: xelatex
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo      = TRUE,
+  warning   = FALSE,
+  message   = FALSE,
+  fig.align = "center"
+)
+
+pkgs <- c("tidyverse", "lubridate", "broom", "kableExtra",
+          "scales", "patchwork", "pROC")
+for (p in pkgs) {
+  if (!requireNamespace(p, quietly = TRUE)) install.packages(p, repos = "https://cloud.r-project.org")
+  library(p, character.only = TRUE)
+}
+```
+
+---
+
+# Purpose
+
+This document validates the IPW weights produced by `compute_ipw_weights.Rmd`
+by addressing four questions in sequence:
+
+1. **Covariate balance** — Do the weights successfully equalise the covariate
+   distributions between observed and unobserved rows? (Love plot + SMD table)
+2. **Positivity** — Are there covariate regions where observability is near
+   zero, making weighting unreliable or extrapolatory?
+3. **Trend correction** — Does IPW weighting move the queue-time trend slope
+   in the expected direction, and by how much?
+4. **Robustness** — Is the corrected slope stable across different trimming
+   thresholds (P95 → P99.5) and consistent within ISO and technology subgroups?
+
+**What "closer to the true trend" means here:** We cannot observe the true
+trend directly — that is the whole selection problem. What we *can* show is
+that (a) the weights achieve balance on observed covariates, and (b) the
+corrected slope is stable to reasonable changes in methodology. Stability
+under perturbation is the operational proxy for "getting closer to truth."
+
+**Prerequisites:** Run `compute_ipw_weights.Rmd` first to generate
+`ipw_weights.csv` in `../../data/` (or `$PLANNING_QUEUES_MODEL_DIR`).
+
+---
+
+# 1  Load Data
+
+```{r paths}
+DATA_PATH    <- Sys.getenv(
+  "PLANNING_QUEUES_DATA_V7",
+  "../../data/ISO_EIA_Merged_v7.csv"
+)
+WEIGHTS_PATH <- file.path(
+  Sys.getenv("PLANNING_QUEUES_MODEL_DIR", "../../data"),
+  "ipw_weights.csv"
+)
+```
+
+```{r load}
+df_raw  <- read_csv(DATA_PATH,    show_col_types = FALSE)
+weights <- read_csv(WEIGHTS_PATH, show_col_types = FALSE)
+```
+
+```{r merge}
+# Reproduce the same feature engineering as compute_ipw_weights.Rmd
+# so joins and variable definitions are consistent
+df <- df_raw %>%
+  mutate(
+    row_id  = row_number(),
+    tiq_raw = suppressWarnings(as.numeric(time_in_queue)),
+    has_tiq = as.integer(!is.na(tiq_raw) & tiq_raw > 0),
+    mw_num  = suppressWarnings(as.numeric(mw)),
+    log_mw  = log1p(mw_num),
+    queue_yr = year(suppressWarnings(as.Date(queue_date))),
+    tech = case_when(
+      str_detect(type1, regex("solar|photovoltaic", ignore_case = TRUE))  ~ "Solar",
+      str_detect(type1, regex("offshore",           ignore_case = TRUE))  ~ "Offshore Wind",
+      str_detect(type1, regex("wind",               ignore_case = TRUE))  ~ "Wind",
+      str_detect(type1, regex("batter|storage",     ignore_case = TRUE))  ~ "Battery",
+      str_detect(type1, regex("natural gas|gas",    ignore_case = TRUE))  ~ "Gas",
+      str_detect(type1, regex("coal",               ignore_case = TRUE))  ~ "Coal",
+      str_detect(type1, regex("nuclear",            ignore_case = TRUE))  ~ "Nuclear",
+      str_detect(type1, regex("hydro",              ignore_case = TRUE))  ~ "Hydro",
+      TRUE                                                                  ~ "Other"
+    ),
+    tech = factor(tech),
+    iso  = factor(iso)
+  )
+
+# v3: restrict to the same population the propensity model was trained on —
+# resolved projects only (completed + withdrawn), West excluded.
+# This prevents still-in-queue rows (right-censored, not selection-missing)
+# and West rows (positivity failure, no weights) from distorting the SMD table.
+model_df <- df %>%
+  filter(
+    status_group %in% c("completed", "withdrawn"),
+    !is.na(iso), !is.na(tech), !is.na(log_mw),
+    iso != "West"
+  ) %>%
+  droplevels() %>%
+  left_join(weights %>% select(row_id, p_obs, ipw_stab, ipw_trim), by = "row_id")
+
+# Diagnostic: if rows_with_weights is 0, the row_id join failed —
+# regenerate ipw_weights.csv by rerunning compute_ipw_weights.Rmd first.
+rows_with_weights <- sum(!is.na(model_df$ipw_trim))
+if (rows_with_weights == 0) stop("Join failed: no rows matched on row_id. Rerun compute_ipw_weights.Rmd.")
+```
+
+```{r load-summary, echo=FALSE}
+tibble(
+  Metric = c("Total rows in v5", "Model-eligible rows", "Rows with valid weights",
+             "Observed (has TIQ)", "Unobserved (no TIQ)"),
+  Value  = c(
+    comma(nrow(df_raw)),
+    comma(nrow(model_df)),
+    comma(sum(!is.na(model_df$ipw_trim))),
+    comma(sum(model_df$has_tiq == 1, na.rm = TRUE)),
+    comma(sum(model_df$has_tiq == 0, na.rm = TRUE))
+  )
+) %>%
+  kbl(col.names = c("", ""), booktabs = TRUE,
+      caption = "Dataset summary after joining weights") %>%
+  kable_styling(latex_options = c("striped", "hold_position"), full_width = FALSE)
+```
+
+---
+
+# 2  Covariate Balance
+
+The core test for IPW validity. Before weighting, observed rows (has\\_tiq = 1)
+differ systematically from unobserved rows (has\\_tiq = 0) — that is the whole
+basis for using IPW. After weighting, those differences should shrink toward
+zero.
+
+**Standardised Mean Difference (SMD)** is the standard metric:
+
+$$\text{SMD} = \frac{\bar{X}_{\text{obs}} - \bar{X}_{\text{unobs}}}
+{\sqrt{(s^2_{\text{obs}} + s^2_{\text{unobs}}) / 2}}$$
+
+A weighted SMD < 0.10 is the conventional threshold for "adequate balance."
+
+```{r balance-compute}
+# Compute SMD for continuous covariates and ISO/tech dummies
+compute_smd <- function(data, var, weight_col = NULL) {
+  obs   <- data %>% filter(has_tiq == 1)
+  unobs <- data %>% filter(has_tiq == 0)
+
+  x_obs   <- obs[[var]]
+  x_unobs <- unobs[[var]]
+
+  # Drop rows where the weight is NA (e.g. West rows excluded from weights file).
+  # The weighted SMD is computed only over rows with valid weights.
+  if (!is.null(weight_col)) {
+    w_raw  <- obs[[weight_col]]
+    keep   <- !is.na(w_raw) & !is.na(x_obs)
+    x_obs_w <- x_obs[keep]
+    w_obs   <- w_raw[keep]
+  } else {
+    keep    <- !is.na(x_obs)
+    x_obs_w <- x_obs[keep]
+    w_obs   <- rep(1, sum(keep))
+  }
+
+  # Weighted mean: both x and w are guaranteed non-NA by the keep filter above
+  wtd_mean <- function(x, w) {
+    if (length(x) == 0 || sum(w) == 0) return(NA_real_)
+    sum(x * w) / sum(w)
+  }
+
+  m_obs_unw   <- mean(x_obs,    na.rm = TRUE)
+  m_unobs_unw <- mean(x_unobs,  na.rm = TRUE)
+  m_obs_wtd   <- wtd_mean(x_obs_w, w_obs)   # uses NA-cleaned vectors
+
+  s_obs   <- sd(x_obs,   na.rm = TRUE)
+  s_unobs <- sd(x_unobs, na.rm = TRUE)
+  pooled  <- sqrt((s_obs^2 + s_unobs^2) / 2)
+
+  smd_before <- if (is.na(pooled) || pooled == 0) NA_real_ else (m_obs_unw - m_unobs_unw) / pooled
+  smd_after  <- if (is.na(pooled) || pooled == 0 || is.na(m_obs_wtd)) NA_real_ else (m_obs_wtd - m_unobs_unw) / pooled
+
+  tibble(variable = var, smd_before = smd_before, smd_after = smd_after)
+}
+
+# Continuous covariates
+# v3 propensity formula: has_tiq ~ iso + tech + log_mw
+# log_mw is in the model — we expect it to balance.
+# queue_yr is NOT in the propensity model (intentionally). It is included here
+# as a diagnostic: if the weights inadvertently adjust queue_yr, the SMD will
+# shrink. If it stays roughly the same before and after, the weights are not
+# removing the time trend we need to estimate in Stage 2.
+cont_balance <- bind_rows(
+  compute_smd(model_df, "log_mw",   "ipw_trim"),
+  compute_smd(model_df, "queue_yr", "ipw_trim")
+)
+
+# ISO dummies
+iso_balance <- model_df %>%
+  filter(!is.na(iso)) %>%
+  mutate(iso_chr = as.character(iso)) %>%
+  { unique(.$iso_chr) } %>%
+  map_dfr(function(lvl) {
+    tmp <- model_df %>%
+      filter(!is.na(iso)) %>%
+      mutate(dummy = as.integer(as.character(iso) == lvl))
+    compute_smd(tmp, "dummy", "ipw_trim") %>%
+      mutate(variable = paste0("iso_", lvl))
+  })
+
+# Tech dummies
+tech_balance <- model_df %>%
+  filter(!is.na(tech)) %>%
+  mutate(tech_chr = as.character(tech)) %>%
+  { unique(.$tech_chr) } %>%
+  map_dfr(function(lvl) {
+    tmp <- model_df %>%
+      filter(!is.na(tech)) %>%
+      mutate(dummy = as.integer(as.character(tech) == lvl))
+    compute_smd(tmp, "dummy", "ipw_trim") %>%
+      mutate(variable = paste0("tech_", lvl))
+  })
+
+balance_tbl <- bind_rows(cont_balance, iso_balance, tech_balance) %>%
+  mutate(
+    adequate_after = abs(smd_after) < 0.10,
+    improved       = abs(smd_after) < abs(smd_before)
+  )
+```
+
+## 2.1  SMD Table
+
+```{r balance-table, echo=FALSE}
+balance_tbl %>%
+  mutate(
+    smd_before = round(smd_before, 3),
+    smd_after  = round(smd_after,  3),
+    Adequate   = ifelse(adequate_after, "yes", "NO")
+  ) %>%
+  select(Variable = variable,
+         `SMD before weighting` = smd_before,
+         `SMD after weighting`  = smd_after,
+         `|SMD| < 0.10`         = Adequate) %>%
+  kbl(booktabs = TRUE,
+      caption = "Covariate balance before and after IPW weighting. Target: |SMD| < 0.10 after weighting.") %>%
+  kable_styling(latex_options = c("striped", "hold_position", "scale_down"),
+                full_width = FALSE) %>%
+  row_spec(which(balance_tbl$adequate_after == FALSE), bold = TRUE, color = "#e63946") %>%
+  row_spec(0, bold = TRUE)
+```
+
+## 2.2  Love Plot
+
+```{r fig-love, echo=FALSE, fig.cap="Love plot: absolute SMD before (circle) and after (triangle) IPW weighting. Dashed line at 0.10 is the conventional balance threshold. Variables to the right of the dashed line after weighting indicate residual imbalance.", fig.height=7}
+balance_tbl %>%
+  select(variable, smd_before, smd_after) %>%
+  pivot_longer(cols = c(smd_before, smd_after),
+               names_to = "stage", values_to = "smd") %>%
+  mutate(
+    abs_smd = abs(smd),
+    stage   = factor(stage,
+                     levels = c("smd_before", "smd_after"),
+                     labels = c("Before weighting", "After weighting")),
+    variable = factor(variable,
+                      levels = balance_tbl %>%
+                        arrange(abs(smd_before)) %>% pull(variable))
+  ) %>%
+  ggplot(aes(x = abs_smd, y = variable, shape = stage, colour = stage)) +
+  geom_point(size = 3, alpha = 0.9) +
+  geom_vline(xintercept = 0.10, linetype = "dashed", colour = "grey40") +
+  scale_colour_manual(values = c("Before weighting" = "#e63946",
+                                 "After weighting"  = "#0077b6")) +
+  scale_shape_manual(values  = c("Before weighting" = 16,
+                                 "After weighting"  = 17)) +
+  labs(title   = "Love Plot — Covariate Balance",
+       subtitle = "Dashed line = 0.10 SMD threshold. Blue triangles should be left of line.",
+       x = "Absolute Standardised Mean Difference",
+       y = NULL,
+       colour = NULL, shape = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+```
+
+```{r balance-summary-stats, echo=FALSE}
+tibble(
+  Metric = c(
+    "Variables with adequate balance after weighting (|SMD| < 0.10)",
+    "Variables that improved after weighting",
+    "Max |SMD| after weighting",
+    "Mean |SMD| before weighting",
+    "Mean |SMD| after weighting"
+  ),
+  Value = c(
+    paste0(sum(balance_tbl$adequate_after), " / ", nrow(balance_tbl)),
+    paste0(sum(balance_tbl$improved), " / ", nrow(balance_tbl)),
+    round(max(abs(balance_tbl$smd_after)), 3),
+    round(mean(abs(balance_tbl$smd_before)), 3),
+    round(mean(abs(balance_tbl$smd_after)), 3)
+  )
+) %>%
+  kbl(col.names = c("", ""), booktabs = TRUE,
+      caption = "Balance summary") %>%
+  kable_styling(latex_options = c("striped", "hold_position"), full_width = FALSE)
+```
+
+---
+
+# 3  Positivity (Overlap) Check
+
+IPW requires the positivity assumption: every row must have a non-zero
+probability of being observed, $p_i > 0$. Rows with $p_i \approx 0$ receive
+extreme weights and are effectively extrapolated rather than reweighted.
+
+```{r positivity-compute}
+pos_df <- model_df %>% filter(!is.na(p_obs))
+
+n_near_zero <- sum(pos_df$p_obs < 0.05)
+n_near_one  <- sum(pos_df$p_obs > 0.95)
+pct_near_zero <- round(100 * n_near_zero / nrow(pos_df), 2)
+```
+
+## 3.1  P(observed) Distribution
+
+```{r fig-positivity, echo=FALSE, fig.cap="Distribution of fitted observability probabilities. Rows near zero (left tail, shaded red) violate the positivity assumption and receive extreme weights. Rows near one are always observed and receive near-unit weights.", fig.height=4}
+ggplot(pos_df, aes(x = p_obs)) +
+  geom_histogram(bins = 80, fill = "#0077b6", colour = "white", linewidth = 0.2) +
+  geom_rect(aes(xmin = 0, xmax = 0.05, ymin = -Inf, ymax = Inf),
+            fill = "#e63946", alpha = 0.003) +
+  annotate("text", x = 0.025, y = Inf,
+           label = paste0(pct_near_zero, "% of rows\np_obs < 0.05"),
+           vjust = 1.5, hjust = 0.5, size = 3.2, colour = "#e63946") +
+  labs(title   = "Propensity Score (p_obs) Distribution",
+       subtitle = "Red shading = near-zero probability region; weights unreliable here",
+       x = "P(has computable TIQ)", y = "Count") +
+  theme_minimal(base_size = 11)
+```
+
+## 3.2  Positivity by ISO and Technology
+
+```{r fig-positivity-iso, echo=FALSE, fig.cap="Median and 5th-percentile observability probability by ISO. ISOs with low P5 values contain many near-zero rows where weighting extrapolates rather than corrects.", fig.height=4}
+p_iso <- pos_df %>%
+  filter(!is.na(iso)) %>%
+  group_by(iso) %>%
+  summarise(
+    median_p = median(p_obs),
+    p5       = quantile(p_obs, 0.05),
+    .groups  = "drop"
+  ) %>%
+  ggplot(aes(x = reorder(iso, median_p))) +
+  geom_col(aes(y = median_p), fill = "#0077b6", width = 0.6) +
+  geom_point(aes(y = p5), shape = 18, size = 3, colour = "#e63946") +
+  geom_hline(yintercept = 0.05, linetype = "dashed", colour = "grey40") +
+  coord_flip() +
+  labs(title    = "P(observed) by ISO",
+       subtitle = "Blue bar = median; red diamond = 5th percentile",
+       x = NULL, y = "P(has TIQ)") +
+  theme_minimal(base_size = 11)
+
+p_tech <- pos_df %>%
+  filter(!is.na(tech)) %>%
+  group_by(tech) %>%
+  summarise(
+    median_p = median(p_obs),
+    p5       = quantile(p_obs, 0.05),
+    n        = n(),
+    .groups  = "drop"
+  ) %>%
+  filter(n >= 20) %>%
+  ggplot(aes(x = reorder(tech, median_p))) +
+  geom_col(aes(y = median_p), fill = "#43AA8B", width = 0.6) +
+  geom_point(aes(y = p5), shape = 18, size = 3, colour = "#e63946") +
+  geom_hline(yintercept = 0.05, linetype = "dashed", colour = "grey40") +
+  coord_flip() +
+  labs(title    = "P(observed) by Technology",
+       subtitle = "Blue bar = median; red diamond = 5th percentile",
+       x = NULL, y = "P(has TIQ)") +
+  theme_minimal(base_size = 11)
+
+p_iso | p_tech
+```
+
+```{r positivity-table, echo=FALSE}
+pos_df %>%
+  filter(!is.na(iso)) %>%
+  group_by(ISO = iso) %>%
+  summarise(
+    N            = n(),
+    `Median p`   = round(median(p_obs), 3),
+    `P5`         = round(quantile(p_obs, 0.05), 3),
+    `% p < 0.05` = paste0(round(100 * mean(p_obs < 0.05), 1), "%"),
+    .groups      = "drop"
+  ) %>%
+  arrange(`P5`) %>%
+  kbl(booktabs = TRUE,
+      caption = "Positivity by ISO. Low P5 or high \\% p < 0.05 flags extrapolation risk.") %>%
+  kable_styling(latex_options = c("striped", "hold_position"), full_width = FALSE) %>%
+  row_spec(0, bold = TRUE)
+```
+
+---
+
+# 4  Weighted vs. Unweighted Trend
+
+The central validation: does IPW weighting move the queue-time slope in the
+direction and magnitude reported in Stage 0 (unweighted 43 days/yr →
+IPW-corrected 34.5 days/yr)?
+
+This section restricts to **completed projects only** (`status_group == "completed"`) —
+the status group where trend estimation is meaningful. Withdrawn projects are
+excluded; their shorter observed TIQ drives an artificial aggregate improvement
+that conflates the completion trend with composition effects.
+
+```{r trend-prep}
+trend_df <- model_df %>%
+  filter(
+    !is.na(tiq_raw), tiq_raw > 0,
+    !is.na(queue_yr), queue_yr >= 2000, queue_yr <= 2019,
+    !is.na(ipw_trim)
+  ) %>%
+  mutate(
+    tiq_days  = tiq_raw,
+    tiq_years = tiq_raw / 365.25
+  )
+
+# Completed projects only — the population the slope comparison is computed on
+trend_online <- trend_df %>%
+  filter(status_group == "completed")
+```
+
+```{r stage0-benchmark}
+# Stage 0 was computed on ALL rows with computable TIQ (not completed-only),
+# giving an unweighted slope of 43 days/yr and an IPW slope of 34.5 days/yr
+# (−19.6% divergence). Those benchmarks are not directly comparable to a
+# completed-only trend. We recompute the reference here on the same population
+# (completed rows, 2000–2019) so the validation has a proper target.
+#
+# We use all completed rows that have TIQ — including those without weights —
+# so the benchmark is not itself affected by the IPW.
+stage0_ref_df <- df %>%
+  filter(
+    status_group == "completed",
+    iso != "West",
+    !is.na(tiq_raw), tiq_raw > 0,
+    !is.na(queue_yr), queue_yr >= 2000, queue_yr <= 2019
+  ) %>%
+  mutate(tiq_days = tiq_raw)
+
+stage0_annual <- stage0_ref_df %>%
+  group_by(queue_yr) %>%
+  summarise(median_tiq = median(tiq_days, na.rm = TRUE), .groups = "drop")
+
+stage0_slope <- round(coef(lm(median_tiq ~ queue_yr, data = stage0_annual))[["queue_yr"]], 2)
+```
+
+## 4.1  Annual Median — Unweighted vs. Weighted
+
+```{r fig-trend-main, echo=FALSE, fig.cap="Annual median queue time (days) for came-online projects, unweighted vs. IPW-weighted. If weighting is working, the weighted series should diverge upward from the unweighted (because unweighted underrepresents long-queue projects that are harder to match).", fig.height=5}
+annual_unw <- trend_online %>%
+  group_by(queue_yr) %>%
+  summarise(
+    median_tiq = median(tiq_days, na.rm = TRUE),
+    n          = n(),
+    .groups    = "drop"
+  ) %>%
+  mutate(series = "Unweighted")
+
+annual_wtd <- trend_online %>%
+  group_by(queue_yr) %>%
+  summarise(
+    median_tiq = weighted.mean(tiq_days, w = ipw_trim, na.rm = TRUE),
+    n          = n(),
+    .groups    = "drop"
+  ) %>%
+  mutate(series = "IPW-weighted")
+
+annual_combined <- bind_rows(annual_unw, annual_wtd) %>%
+  mutate(series = factor(series, levels = c("Unweighted", "IPW-weighted")))
+
+ggplot(annual_combined, aes(x = queue_yr, y = median_tiq,
+                             colour = series, linetype = series)) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 2.5) +
+  scale_colour_manual(values = c("Unweighted"   = "#adb5bd",
+                                 "IPW-weighted" = "#0077b6")) +
+  scale_linetype_manual(values = c("Unweighted"   = "dashed",
+                                   "IPW-weighted" = "solid")) +
+  scale_y_continuous(labels = comma) +
+  labs(title    = "Queue Time Trend — Unweighted vs. IPW-Weighted",
+       subtitle = "Came-online projects only; cohort years 2000–2019",
+       x = "Queue entry year", y = "Median TIQ (days)",
+       colour = NULL, linetype = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+```
+
+## 4.2  Slope Comparison (OLS on Annual Medians)
+
+```{r slope-comparison}
+fit_unw <- lm(median_tiq ~ queue_yr, data = annual_unw)
+fit_wtd <- lm(median_tiq ~ queue_yr, data = annual_wtd)
+
+slope_tbl <- tibble(
+  Series      = c("Unweighted", "IPW-weighted"),
+  `Slope (days/yr)` = c(
+    round(coef(fit_unw)[["queue_yr"]], 2),
+    round(coef(fit_wtd)[["queue_yr"]], 2)
+  ),
+  `R²` = c(
+    round(summary(fit_unw)$r.squared, 3),
+    round(summary(fit_wtd)$r.squared, 3)
+  ),
+  `p-value` = c(
+    round(summary(fit_unw)$coefficients["queue_yr", "Pr(>|t|)"], 4),
+    round(summary(fit_wtd)$coefficients["queue_yr", "Pr(>|t|)"], 4)
+  )
+)
+
+# Compute divergence
+slope_divergence <- round(
+  100 * (slope_tbl$`Slope (days/yr)`[2] - slope_tbl$`Slope (days/yr)`[1]) /
+    abs(slope_tbl$`Slope (days/yr)`[1]), 1
+)
+```
+
+```{r slope-table, echo=FALSE}
+slope_tbl %>%
+  kbl(booktabs = TRUE,
+      caption = paste0(
+        "OLS slope on annual median TIQ (completed projects, 2000–2019). ",
+        "Slope divergence = ", slope_divergence, "%. ",
+        "Reference unweighted slope (all completed rows, no weights) = ",
+        stage0_slope, " days/yr. ",
+        "Target: divergence near −20%; large negative divergence (e.g. −90%) ",
+        "indicates overcorrection."
+      )) %>%
+  kable_styling(latex_options = c("striped", "hold_position"), full_width = FALSE) %>%
+  row_spec(0, bold = TRUE)
+```
+
+---
+
+# 5  Trimming Sensitivity
+
+The P99 trimming threshold in Stage 1 is a methodological choice. If the
+corrected slope changes materially across plausible thresholds, the reported
++70–75% deterioration estimate is fragile. Stability is a necessary (though
+not sufficient) condition for trust.
+
+```{r trimming-sensitivity}
+trim_levels <- c(0.95, 0.975, 0.99, 0.995, 1.00)  # 1.00 = no trimming
+
+trim_results <- map_dfr(trim_levels, function(q) {
+  trim_thresh <- if (q == 1.00) Inf else quantile(model_df$ipw_stab, q, na.rm = TRUE)
+
+  trimmed_df <- model_df %>%
+    filter(!is.na(ipw_stab)) %>%
+    mutate(ipw_test = pmin(ipw_stab, trim_thresh))
+
+  annual <- trimmed_df %>%
+    filter(
+      !is.na(tiq_raw), tiq_raw > 0,
+      !is.na(queue_yr), queue_yr >= 2000, queue_yr <= 2019,
+      !is.na(status_group),
+      str_detect(status_group, regex("complet|online|came", ignore_case = TRUE))
+    ) %>%
+    group_by(queue_yr) %>%
+    summarise(med_tiq = weighted.mean(tiq_raw, w = ipw_test, na.rm = TRUE),
+              .groups = "drop")
+
+  if (nrow(annual) < 5) return(tibble(threshold = q, slope = NA_real_,
+                                       max_weight = NA_real_))
+
+  fit   <- lm(med_tiq ~ queue_yr, data = annual)
+  slope <- coef(fit)[["queue_yr"]]
+  max_w <- max(trimmed_df$ipw_test, na.rm = TRUE)
+
+  tibble(
+    threshold  = q,
+    label      = if (q == 1.00) "No trim" else paste0("P", round(q * 100, 1)),
+    slope      = round(slope, 2),
+    max_weight = round(max_w, 2)
+  )
+})
+```
+
+```{r fig-trim-sensitivity, echo=FALSE, fig.cap="Slope sensitivity to trimming threshold. A flat line means the corrected estimate is robust to trimming decisions. Large movements indicate dependence on extreme weights.", fig.height=4}
+p_slope <- trim_results %>%
+  filter(!is.na(slope)) %>%
+  ggplot(aes(x = label, y = slope, group = 1)) +
+  geom_line(linewidth = 1.1, colour = "#0077b6") +
+  geom_point(size = 3, colour = "#0077b6") +
+  geom_hline(
+    yintercept = coef(lm(median_tiq ~ queue_yr, data = annual_unw))[["queue_yr"]],
+    linetype = "dashed", colour = "#adb5bd"
+  ) +
+  annotate("text", x = 1, y = coef(lm(median_tiq ~ queue_yr,
+           data = annual_unw))[["queue_yr"]] + 0.5,
+           label = "Unweighted slope", hjust = 0, size = 3.2, colour = "#adb5bd") +
+  labs(title    = "Slope Sensitivity to IPW Trimming Threshold",
+       subtitle = "Dashed line = unweighted baseline slope",
+       x = "Trimming threshold", y = "Slope (days / year)") +
+  theme_minimal(base_size = 11)
+
+p_weight <- trim_results %>%
+  filter(!is.na(max_weight)) %>%
+  ggplot(aes(x = label, y = max_weight, group = 1)) +
+  geom_line(linewidth = 1.1, colour = "#e63946") +
+  geom_point(size = 3, colour = "#e63946") +
+  labs(title    = "Maximum Weight by Trimming Threshold",
+       subtitle = "Higher max weight = more influence from extreme rows",
+       x = "Trimming threshold", y = "Max ipw weight") +
+  theme_minimal(base_size = 11)
+
+p_slope | p_weight
+```
+
+```{r trim-table, echo=FALSE}
+trim_results %>%
+  filter(!is.na(slope)) %>%
+  select(Threshold = label, `Slope (days/yr)` = slope, `Max weight` = max_weight) %>%
+  kbl(booktabs = TRUE,
+      caption = "Slope under different trimming thresholds. Stability across rows = robust estimate.") %>%
+  kable_styling(latex_options = c("striped", "hold_position"), full_width = FALSE) %>%
+  row_spec(0, bold = TRUE) %>%
+  row_spec(3, bold = TRUE)  # P99 = the chosen threshold in Stage 1
+```
+
+---
+
+# 6  Subgroup Consistency
+
+If IPW overcorrects for some ISOs and undercorrects for others, the aggregate
+slope may look stable while masking within-group distortions. This section
+checks whether the direction of correction (weighted slope < unweighted slope)
+is consistent across subgroups.
+
+```{r subgroup-iso}
+subgroup_iso <- model_df %>%
+  filter(
+    !is.na(tiq_raw), tiq_raw > 0,
+    !is.na(queue_yr), queue_yr >= 2000, queue_yr <= 2019,
+    !is.na(ipw_trim), !is.na(iso),
+    !is.na(status_group),
+    str_detect(status_group, regex("complet|online|came", ignore_case = TRUE))
+  ) %>%
+  group_by(iso, queue_yr) %>%
+  summarise(
+    med_unw = median(tiq_raw, na.rm = TRUE),
+    med_wtd = weighted.mean(tiq_raw, w = ipw_trim, na.rm = TRUE),
+    n       = n(),
+    .groups = "drop"
+  ) %>%
+  group_by(iso) %>%
+  filter(n() >= 5, sum(n) >= 30) %>%   # require enough data to fit a line
+  summarise(
+    slope_unw  = tryCatch(coef(lm(med_unw ~ queue_yr))[["queue_yr"]], error = function(e) NA),
+    slope_wtd  = tryCatch(coef(lm(med_wtd ~ queue_yr))[["queue_yr"]], error = function(e) NA),
+    n_cohorts  = n(),
+    .groups    = "drop"
+  ) %>%
+  filter(!is.na(slope_unw), !is.na(slope_wtd)) %>%
+  mutate(
+    correction_pct  = round(100 * (slope_wtd - slope_unw) / abs(slope_unw), 1),
+    consistent      = (slope_wtd < slope_unw)   # TRUE if IPW reduces slope (expected direction)
+  )
+```
+
+```{r subgroup-tech}
+subgroup_tech <- model_df %>%
+  filter(
+    !is.na(tiq_raw), tiq_raw > 0,
+    !is.na(queue_yr), queue_yr >= 2000, queue_yr <= 2019,
+    !is.na(ipw_trim), !is.na(tech),
+    !is.na(status_group),
+    str_detect(status_group, regex("complet|online|came", ignore_case = TRUE))
+  ) %>%
+  group_by(tech, queue_yr) %>%
+  summarise(
+    med_unw = median(tiq_raw, na.rm = TRUE),
+    med_wtd = weighted.mean(tiq_raw, w = ipw_trim, na.rm = TRUE),
+    n       = n(),
+    .groups = "drop"
+  ) %>%
+  group_by(tech) %>%
+  filter(n() >= 5, sum(n) >= 30) %>%
+  summarise(
+    slope_unw  = tryCatch(coef(lm(med_unw ~ queue_yr))[["queue_yr"]], error = function(e) NA),
+    slope_wtd  = tryCatch(coef(lm(med_wtd ~ queue_yr))[["queue_yr"]], error = function(e) NA),
+    n_cohorts  = n(),
+    .groups    = "drop"
+  ) %>%
+  filter(!is.na(slope_unw), !is.na(slope_wtd)) %>%
+  mutate(
+    correction_pct  = round(100 * (slope_wtd - slope_unw) / abs(slope_unw), 1),
+    consistent      = (slope_wtd < slope_unw)
+  )
+```
+
+## 6.1  ISO Subgroups
+
+```{r fig-subgroup-iso, echo=FALSE, fig.cap="Unweighted (grey) vs. IPW-weighted (blue) slopes by ISO. Consistent downward correction (blue below grey) confirms the weights work in the expected direction across ISOs.", fig.height=4.5}
+subgroup_iso %>%
+  select(iso, Unweighted = slope_unw, `IPW-weighted` = slope_wtd) %>%
+  pivot_longer(cols = c(Unweighted, `IPW-weighted`),
+               names_to = "series", values_to = "slope") %>%
+  mutate(series = factor(series, levels = c("Unweighted", "IPW-weighted"))) %>%
+  ggplot(aes(x = reorder(iso, slope), y = slope, fill = series)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6) +
+  geom_hline(yintercept = 0, colour = "grey30") +
+  scale_fill_manual(values = c("Unweighted"   = "#adb5bd",
+                                "IPW-weighted" = "#0077b6")) +
+  coord_flip() +
+  labs(title    = "Slope by ISO — Unweighted vs. IPW-Weighted",
+       subtitle = "Consistent downward shift = weights working as expected",
+       x = NULL, y = "Slope (days / year)", fill = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+```
+
+```{r subgroup-iso-table, echo=FALSE}
+subgroup_iso %>%
+  mutate(consistent = ifelse(consistent, "yes", "NO")) %>%
+  select(ISO = iso, `Unweighted slope` = slope_unw,
+         `Weighted slope` = slope_wtd,
+         `Correction (%)` = correction_pct,
+         `Direction OK` = consistent) %>%
+  arrange(`Unweighted slope`) %>%
+  kbl(booktabs = TRUE,
+      caption = "Slope by ISO. 'Direction OK' = weighted slope moved in expected direction (downward).") %>%
+  kable_styling(latex_options = c("striped", "hold_position"), full_width = FALSE) %>%
+  row_spec(which(subgroup_iso$consistent == FALSE), bold = TRUE, color = "#e63946") %>%
+  row_spec(0, bold = TRUE)
+```
+
+## 6.2  Technology Subgroups
+
+```{r fig-subgroup-tech, echo=FALSE, fig.cap="Unweighted vs. IPW-weighted slopes by technology. Technologies where the weighted slope moves in the wrong direction signal that the propensity model may be misspecified for that group.", fig.height=4}
+subgroup_tech %>%
+  select(tech, Unweighted = slope_unw, `IPW-weighted` = slope_wtd) %>%
+  pivot_longer(cols = c(Unweighted, `IPW-weighted`),
+               names_to = "series", values_to = "slope") %>%
+  mutate(series = factor(series, levels = c("Unweighted", "IPW-weighted"))) %>%
+  ggplot(aes(x = reorder(tech, slope), y = slope, fill = series)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6) +
+  geom_hline(yintercept = 0, colour = "grey30") +
+  scale_fill_manual(values = c("Unweighted"   = "#adb5bd",
+                                "IPW-weighted" = "#43AA8B")) +
+  coord_flip() +
+  labs(title    = "Slope by Technology — Unweighted vs. IPW-Weighted",
+       x = NULL, y = "Slope (days / year)", fill = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+```
+
+```{r subgroup-tech-table, echo=FALSE}
+subgroup_tech %>%
+  mutate(consistent = ifelse(consistent, "yes", "NO")) %>%
+  select(Technology = tech, `Unweighted slope` = slope_unw,
+         `Weighted slope` = slope_wtd,
+         `Correction (%)` = correction_pct,
+         `Direction OK` = consistent) %>%
+  arrange(`Unweighted slope`) %>%
+  kbl(booktabs = TRUE,
+      caption = "Slope by technology. Rows in red = correction moved in unexpected direction.") %>%
+  kable_styling(latex_options = c("striped", "hold_position"), full_width = FALSE) %>%
+  row_spec(which(subgroup_tech$consistent == FALSE), bold = TRUE, color = "#e63946") %>%
+  row_spec(0, bold = TRUE)
+```
+
+---
+
+# 7  Summary and Interpretation
+
+```{r summary-table, echo=FALSE}
+# Compute aggregate pass/fail across all checks
+n_balance_pass  <- sum(balance_tbl$adequate_after)
+n_balance_total <- nrow(balance_tbl)
+pct_zero        <- round(100 * n_near_zero / nrow(pos_df), 2)
+slope_unw_final <- round(coef(lm(median_tiq ~ queue_yr, data = annual_unw))[["queue_yr"]], 2)
+slope_wtd_final <- round(coef(lm(median_tiq ~ queue_yr, data = annual_wtd))[["queue_yr"]], 2)
+trim_range      <- round(diff(range(trim_results$slope, na.rm = TRUE)), 2)
+
+tibble(
+  Check = c(
+    "Covariate balance (|SMD| < 0.10)",
+    "Positivity (% rows with p_obs < 0.05)",
+    "Slope divergence (unweighted → weighted)",
+    "Trimming sensitivity (slope range P95–P99.5)",
+    "ISO subgroup direction consistency",
+    "Tech subgroup direction consistency"
+  ),
+  Result = c(
+    paste0(n_balance_pass, " / ", n_balance_total, " variables pass"),
+    paste0(pct_zero, "% of rows — review ISOs with low P5"),
+    paste0(slope_unw_final, " → ", slope_wtd_final, " days/yr (",
+           slope_divergence, "% divergence)"),
+    paste0(trim_range, " days/yr range across thresholds"),
+    paste0(sum(subgroup_iso$consistent), " / ", nrow(subgroup_iso), " ISOs corrected downward"),
+    paste0(sum(subgroup_tech$consistent), " / ", nrow(subgroup_tech), " techs corrected downward")
+  ),
+  Verdict = c(
+    ifelse(n_balance_pass / n_balance_total >= 0.80, "Pass", "Investigate"),
+    ifelse(pct_zero < 5, "Pass", "Investigate"),
+    ifelse(abs(slope_divergence) >= 10, "Material correction — weights are working",
+           "Small correction — check propensity model"),
+    ifelse(trim_range < 5, "Stable", "Sensitive to trimming — investigate"),
+    ifelse(sum(subgroup_iso$consistent) / nrow(subgroup_iso) >= 0.75, "Consistent", "Inconsistent"),
+    ifelse(sum(subgroup_tech$consistent) / nrow(subgroup_tech) >= 0.75, "Consistent", "Inconsistent")
+  )
+) %>%
+  kbl(booktabs = TRUE,
+      caption = "Validation summary across all robustness checks.") %>%
+  kable_styling(latex_options = c("striped", "hold_position", "scale_down"),
+                full_width = FALSE) %>%
+  row_spec(0, bold = TRUE)
+```
+
+**Interpretation guidance:**
+
+- If balance fails for a specific ISO or technology, the propensity model may
+  need interaction terms (e.g., `iso * queue_yr`) to better capture selection
+  in that subgroup.
+- If positivity fails for SPP (expected given ~5% match rate), consider
+  excluding SPP from IPW-weighted models and reporting it as a scope limitation.
+- If trimming sensitivity is high (slope range > 5 days/yr), re-examine the
+  weight distribution for that threshold before using it in Stage 2.
+- These checks address *observed* confounders only. Residual bias from
+  unobserved confounders (developer resources, local permitting difficulty,
+  transmission congestion) cannot be eliminated by IPW and should be
+  acknowledged as a limitation in all downstream analyses.
+
+---
+
+*Generated: `r Sys.Date()` | Validation of Stage 1 IPW weights for PlanningQueues policy model*

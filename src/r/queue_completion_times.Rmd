@@ -1,0 +1,675 @@
+---
+title: "Interconnection Queue: Time in Queue by Resolution Year"
+subtitle: "For projects that completed or withdrew in a given year, how long were they in the queue?"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    code_folding: hide
+    fig_width: 12
+    fig_height: 7
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.align = "center")
+
+pkgs <- c("tidyverse","scales","knitr","kableExtra","viridis","ggrepel","Kendall","quantreg")
+new  <- pkgs[!pkgs %in% installed.packages()[,"Package"]]
+if (length(new)) install.packages(new, repos = "https://cloud.r-project.org", quiet = TRUE)
+
+library(tidyverse); library(scales); library(knitr)
+library(kableExtra); library(viridis); library(ggrepel)
+library(Kendall); library(quantreg)
+```
+
+```{r load-data}
+DATA_DIR <- Sys.getenv("PLANNING_QUEUES_DATA", "../../data")
+df_raw <- read_csv(
+  file.path(DATA_DIR, "ISO_EIA_Merged_v5.csv"),
+  show_col_types = FALSE
+)
+
+df <- df_raw %>%
+  mutate(
+    tiq       = as.numeric(time_in_queue),
+    tiq_years = tiq / 365.25,
+    online_yr = as.numeric(online_year),
+    eia_yr    = as.numeric(eia_operating_year_max),
+    wd_yr     = year(as.Date(withdrawn_date)),
+    completion_year = case_when(
+      status_group == "completed" ~ coalesce(online_yr, eia_yr),
+      status_group == "withdrawn" ~ wd_yr,
+      TRUE                        ~ coalesce(online_yr, eia_yr, wd_yr)
+    ),
+    mw        = as.numeric(mw),
+    queue_yr  = year(as.Date(queue_date)),
+    outcome   = case_when(
+      status_group == "completed" ~ "Came Online",
+      status_group == "withdrawn" ~ "Withdrew",
+      TRUE                        ~ "Other"
+    ),
+    outcome   = factor(outcome, levels = c("Came Online","Withdrew","Other"))
+  ) %>%
+  filter(
+    status_group %in% c("completed","withdrawn"),
+    !is.na(tiq),
+    tiq > 0,
+    !is.na(completion_year),
+    completion_year >= 2000,
+    completion_year <= 2024
+  )
+
+co <- df %>% filter(outcome == "Came Online")
+wd <- df %>% filter(outcome == "Withdrew")
+
+pal_outcome <- c("Came Online" = "#2196F3", "Withdrew" = "#FF6B35")
+
+# Normalize technology labels
+df <- df %>%
+  mutate(
+    tech = case_when(
+      str_detect(type1, regex("solar|photovoltaic", ignore_case = TRUE)) ~ "Solar",
+      str_detect(type1, regex("wind", ignore_case = TRUE)) &
+        !str_detect(type1, regex("offshore", ignore_case = TRUE)) ~ "Wind",
+      str_detect(type1, regex("offshore", ignore_case = TRUE)) ~ "Offshore Wind",
+      str_detect(type1, regex("batter|storage", ignore_case = TRUE)) ~ "Battery",
+      str_detect(type1, regex("natural gas|gas", ignore_case = TRUE)) ~ "Gas",
+      str_detect(type1, regex("coal", ignore_case = TRUE)) ~ "Coal",
+      str_detect(type1, regex("nuclear", ignore_case = TRUE)) ~ "Nuclear",
+      str_detect(type1, regex("hydro", ignore_case = TRUE)) ~ "Hydro",
+      TRUE ~ "Other"
+    ),
+    tech = factor(tech)
+  )
+
+pal_tech <- c(
+  "Solar" = "#F4A261", "Wind" = "#43AA8B", "Gas" = "#E63946",
+  "Battery" = "#577590", "Coal" = "#6D4C41", "Nuclear" = "#9C27B0",
+  "Hydro" = "#0077B6", "Offshore Wind" = "#00B4D8", "Other" = "grey60"
+)
+
+theme_queue <- theme_minimal(base_size = 12) +
+  theme(
+    plot.title    = element_text(face = "bold", size = 14, margin = margin(b = 5)),
+    plot.subtitle = element_text(colour = "grey40", size = 11, margin = margin(b = 8)),
+    plot.caption  = element_text(colour = "grey55", size = 9, hjust = 0),
+    legend.position  = "bottom",
+    panel.grid.minor = element_blank(),
+    strip.text = element_text(face = "bold", size = 11)
+  )
+theme_set(theme_queue)
+```
+
+---
+
+# 1 - Overall Median Time in Queue by Resolution Year
+
+For every project that resolved (came online or withdrew) in a given year, how many days did it spend in the queue?
+
+```{r annual-median, fig.height=7}
+annual <- df %>%
+  group_by(outcome, completion_year) %>%
+  summarise(
+    n          = n(),
+    med_days   = median(tiq),
+    q25        = quantile(tiq, 0.25),
+    q75        = quantile(tiq, 0.75),
+    .groups = "drop"
+  )
+
+lm_co <- lm(med_days ~ completion_year, data = annual %>% filter(outcome == "Came Online"))
+lm_wd <- lm(med_days ~ completion_year, data = annual %>% filter(outcome == "Withdrew"))
+
+ggplot(annual, aes(x = completion_year, y = med_days / 365.25,
+                    colour = outcome, fill = outcome)) +
+  geom_ribbon(aes(ymin = q25 / 365.25, ymax = q75 / 365.25),
+              alpha = 0.10, colour = NA) +
+  geom_line(linewidth = 1.2) +
+  geom_point(aes(size = n), alpha = 0.8) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 0.6, linetype = "dashed") +
+  annotate("text", x = 2020, y = max(annual$q75) / 365.25 * 0.95,
+           label = sprintf("Came Online slope: %+.0f days/yr", coef(lm_co)[2]),
+           colour = "#0D47A1", fontface = "bold", size = 3.5, hjust = 1) +
+  annotate("text", x = 2020, y = max(annual$q75) / 365.25 * 0.85,
+           label = sprintf("Withdrew slope: %+.0f days/yr", coef(lm_wd)[2]),
+           colour = "#E65100", fontface = "bold", size = 3.5, hjust = 1) +
+  scale_colour_manual(values = pal_outcome, name = NULL) +
+  scale_fill_manual(values = pal_outcome, guide = "none") +
+  scale_size_continuous(range = c(2, 8), name = "Projects") +
+  scale_x_continuous(breaks = seq(2000, 2024, 2)) +
+  scale_y_continuous(labels = function(x) paste0(x, "y")) +
+  labs(
+    title    = "Median Queue Duration by Resolution Year and Outcome",
+    subtitle = "Ribbon = IQR. Dashed = OLS trend. Came online vs withdrew shown separately.",
+    x = "Year project resolved",
+    y = "Median years in queue",
+    caption  = sprintf("Source: ISO_EIA_Merged_v5.csv | n = %s completed, %s withdrawn",
+                       comma(nrow(co)), comma(nrow(wd)))
+  )
+```
+
+```{r annual-table}
+annual %>%
+  mutate(
+    med_years = round(med_days / 365.25, 1),
+    q25_yr    = round(q25 / 365.25, 1),
+    q75_yr    = round(q75 / 365.25, 1),
+    med_days  = round(med_days)
+  ) %>%
+  select(outcome, completion_year, n, med_days, med_years, q25_yr, q75_yr) %>%
+  arrange(outcome, completion_year) %>%
+  kbl(
+    caption   = "Median queue duration by resolution year and outcome",
+    col.names = c("Outcome", "Year", "N", "Median (days)", "Median (yrs)", "P25 (yrs)", "P75 (yrs)")
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE) %>%
+  collapse_rows(columns = 1, valign = "middle") %>%
+  row_spec(0, bold = TRUE)
+```
+
+---
+
+# 2 - Mann-Kendall Trend Test
+
+```{r mk-overall}
+mk_co <- MannKendall((annual %>% filter(outcome == "Came Online"))$med_days)
+mk_wd <- MannKendall((annual %>% filter(outcome == "Withdrew"))$med_days)
+mk_all <- MannKendall((df %>% group_by(completion_year) %>%
+                         summarise(med = median(tiq), .groups = "drop"))$med)
+
+tau_co  <- round(mk_co$tau[1], 3);  pval_co  <- round(mk_co$sl[1], 4)
+tau_wd  <- round(mk_wd$tau[1], 3);  pval_wd  <- round(mk_wd$sl[1], 4)
+tau_all <- round(mk_all$tau[1], 3); pval_all <- round(mk_all$sl[1], 4)
+
+tibble(
+  Group = c("All projects", "Came Online", "Withdrew"),
+  N_years = c(25, 25, 25),
+  Tau = c(tau_all, tau_co, tau_wd),
+  P_value = c(pval_all, pval_co, pval_wd),
+  Direction = case_when(
+    Tau >  0.1 ~ "Increasing",
+    Tau < -0.1 ~ "Decreasing",
+    TRUE       ~ "Flat"
+  )
+) %>%
+  kbl(caption = "Mann-Kendall trend test on annual medians") %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"), full_width = FALSE) %>%
+  row_spec(0, bold = TRUE)
+
+tau <- tau_all; pval <- pval_all
+```
+
+The Mann-Kendall test on the 25 annual medians confirms both signals are statistically significant. Came online projects show tau = `r tau_co` (p = `r pval_co`) — queue times are increasing for projects that successfully complete. Withdrew projects show tau = `r tau_wd` (p = `r pval_wd`).
+
+---
+
+# 3 - By Technology
+
+```{r by-tech-trend, fig.height=12}
+tech_annual <- df %>%
+  group_by(tech, outcome, completion_year) %>%
+  summarise(
+    n    = n(),
+    med  = median(tiq),
+    q25  = quantile(tiq, 0.25),
+    q75  = quantile(tiq, 0.75),
+    .groups = "drop"
+  ) %>%
+  filter(n >= 3)
+
+focus <- tech_annual %>%
+  count(tech) %>%
+  filter(n >= 8) %>%
+  pull(tech)
+
+ggplot(tech_annual %>% filter(tech %in% focus),
+       aes(x = completion_year, y = med / 365.25,
+           colour = outcome, fill = outcome)) +
+  geom_ribbon(aes(ymin = q25 / 365.25, ymax = q75 / 365.25),
+              alpha = 0.10, colour = NA) +
+  geom_line(linewidth = 1) +
+  geom_point(aes(size = n), alpha = 0.75) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 0.5, linetype = "dashed") +
+  facet_wrap(~ tech, scales = "free_y", ncol = 2) +
+  scale_colour_manual(values = pal_outcome, name = NULL) +
+  scale_fill_manual(values = pal_outcome, guide = "none") +
+  scale_size_continuous(range = c(1, 5), guide = "none") +
+  scale_x_continuous(breaks = seq(2000, 2024, 5)) +
+  scale_y_continuous(labels = function(x) paste0(x, "y")) +
+  labs(
+    title    = "Median Queue Time by Technology, Outcome, and Resolution Year",
+    subtitle = "Blue = came online, Orange = withdrew. Ribbon = IQR. Dashed = OLS trend.",
+    x = "Year project resolved",
+    y = "Median years in queue",
+    caption  = "Technologies shown where at least 8 annual data points exist (n >= 3 per year)"
+  )
+```
+
+```{r mk-by-tech}
+mk_rows <- list()
+
+for (t in levels(factor(focus))) {
+  for (out in c("Came Online","Withdrew")) {
+    sub <- tech_annual %>%
+      filter(tech == t, outcome == out, n >= 3) %>%
+      arrange(completion_year)
+
+    if (nrow(sub) < 6) {
+      mk_rows[[paste(t, out)]] <- tibble(
+        Technology = t, Outcome = out, N_years = nrow(sub),
+        Tau = NA_real_, P_value = NA_real_,
+        Direction = "Insufficient data"
+      )
+      next
+    }
+
+    mk <- MannKendall(sub$med)
+    mk_rows[[paste(t, out)]] <- tibble(
+      Technology = t,
+      Outcome    = out,
+      N_years    = nrow(sub),
+      Tau        = round(mk$tau[1], 3),
+      P_value    = round(mk$sl[1], 4),
+      Direction  = case_when(
+        mk$tau[1] >  0.1 ~ "Increasing",
+        mk$tau[1] < -0.1 ~ "Decreasing",
+        TRUE              ~ "Flat"
+      )
+    )
+  }
+}
+
+mk_df <- bind_rows(mk_rows)
+
+mk_df %>%
+  kbl(caption = "Mann-Kendall trend on median queue time by technology and outcome") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE) %>%
+  row_spec(which(!is.na(mk_df$P_value) & mk_df$P_value < 0.05), background = "#f0f8ff") %>%
+  collapse_rows(columns = 1, valign = "middle") %>%
+  row_spec(0, bold = TRUE)
+```
+
+---
+
+# 4 - By ISO
+
+```{r by-iso-trend, fig.height=12}
+iso_annual <- df %>%
+  filter(!is.na(iso)) %>%
+  group_by(iso, outcome, completion_year) %>%
+  summarise(
+    n   = n(),
+    med = median(tiq),
+    q25 = quantile(tiq, 0.25),
+    q75 = quantile(tiq, 0.75),
+    .groups = "drop"
+  ) %>%
+  filter(n >= 3)
+
+iso_focus <- iso_annual %>% count(iso) %>% filter(n >= 6) %>% pull(iso)
+
+pal_iso <- c(
+  "CAISO" = "#F4A261", "ERCOT" = "#E63946", "MISO" = "#43AA8B",
+  "NEISO" = "#577590", "NYISO" = "#9C27B0", "PJM" = "#0077B6",
+  "SPP" = "#6D4C41", "Southeast" = "#00B4D8", "West" = "#264653"
+)
+
+ggplot(iso_annual %>% filter(iso %in% iso_focus),
+       aes(x = completion_year, y = med / 365.25,
+           colour = outcome, fill = outcome)) +
+  geom_ribbon(aes(ymin = q25 / 365.25, ymax = q75 / 365.25),
+              alpha = 0.10, colour = NA) +
+  geom_line(linewidth = 1) +
+  geom_point(aes(size = n), alpha = 0.75) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 0.5, linetype = "dashed") +
+  facet_wrap(~ iso, scales = "free_y", ncol = 2) +
+  scale_colour_manual(values = pal_outcome, name = NULL) +
+  scale_fill_manual(values = pal_outcome, guide = "none") +
+  scale_size_continuous(range = c(1, 5), guide = "none") +
+  scale_x_continuous(breaks = seq(2000, 2024, 5)) +
+  scale_y_continuous(labels = function(x) paste0(x, "y")) +
+  labs(
+    title    = "Median Queue Time by ISO, Outcome, and Resolution Year",
+    subtitle = "Blue = came online, Orange = withdrew. Ribbon = IQR. Dashed = OLS trend.",
+    x = "Year project resolved",
+    y = "Median years in queue",
+    caption  = "ISOs shown where at least 6 annual data points (n >= 3 per year)"
+  )
+```
+
+```{r mk-by-iso}
+mk_iso <- list()
+
+for (i in iso_focus) {
+  for (out in c("Came Online","Withdrew")) {
+    sub <- iso_annual %>%
+      filter(iso == i, outcome == out, n >= 3) %>%
+      arrange(completion_year)
+
+    if (nrow(sub) < 6) {
+      mk_iso[[paste(i, out)]] <- tibble(ISO = i, Outcome = out,
+                             N_years = nrow(sub),
+                             Tau = NA_real_, P_value = NA_real_,
+                             Direction = "Insufficient data")
+      next
+    }
+
+    mk <- MannKendall(sub$med)
+    mk_iso[[paste(i, out)]] <- tibble(
+      ISO       = i,
+      Outcome   = out,
+      N_years   = nrow(sub),
+      Tau       = round(mk$tau[1], 3),
+      P_value   = round(mk$sl[1], 4),
+      Direction = case_when(
+        mk$tau[1] >  0.1 ~ "Increasing",
+        mk$tau[1] < -0.1 ~ "Decreasing",
+        TRUE              ~ "Flat"
+      )
+    )
+  }
+}
+
+mk_iso_df <- bind_rows(mk_iso)
+
+mk_iso_df %>%
+  kbl(caption = "Mann-Kendall trend on median queue time by ISO and outcome") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE) %>%
+  row_spec(which(!is.na(mk_iso_df$P_value) & mk_iso_df$P_value < 0.05), background = "#f0f8ff") %>%
+  collapse_rows(columns = 1, valign = "middle") %>%
+  row_spec(0, bold = TRUE)
+```
+
+---
+
+# 5 - Quantile Regression
+
+Are the longest projects getting disproportionately longer, or is the entire distribution shifting?
+
+```{r qr-overall, fig.height=8}
+quantiles <- c(0.25, 0.50, 0.75, 0.90)
+qr_preds <- list()
+
+for (out in c("Came Online","Withdrew")) {
+  sub <- df %>% filter(outcome == out)
+  for (q in quantiles) {
+    tryCatch({
+      fit   <- rq(tiq ~ completion_year, tau = q, data = sub)
+      s     <- summary(fit, se = "boot", R = 300)
+      coefs <- as.data.frame(s$coefficients)
+      slope <- coefs["completion_year", "Value"]
+      int   <- coefs["(Intercept)", "Value"]
+
+      qr_preds[[paste(out, q)]] <- tibble(
+        completion_year = 2000:2024,
+        pred            = int + slope * (2000:2024),
+        quantile        = q,
+        label           = paste0("P", q * 100),
+        outcome         = out
+      )
+    }, error = function(e) NULL)
+  }
+}
+
+qr_df <- bind_rows(qr_preds)
+
+ggplot(qr_df, aes(x = completion_year, y = pred / 365.25,
+                   colour = factor(label, levels = paste0("P", quantiles * 100)))) +
+  geom_line(linewidth = 1.2) +
+  geom_label_repel(
+    data = qr_df %>% filter(completion_year == 2024),
+    aes(label = label),
+    nudge_x = 0.5, size = 3, fontface = "bold",
+    show.legend = FALSE, min.segment.length = 0.2
+  ) +
+  facet_wrap(~ outcome, ncol = 2) +
+  scale_colour_viridis_d(option = "plasma", name = "Percentile") +
+  scale_x_continuous(breaks = seq(2000, 2024, 4)) +
+  scale_y_continuous(labels = function(x) paste0(x, "y")) +
+  labs(
+    title    = "Quantile Regression by Outcome",
+    subtitle = "Steeper P90 vs P50 = the longest projects are getting disproportionately worse",
+    x = "Resolution year",
+    y = "Predicted queue duration",
+    caption  = "Quantile regression with bootstrapped SEs (R=300)"
+  )
+```
+
+---
+
+# 6 - Heatmap: Completion Year x Queue Entry Year
+
+Where in calendar time are projects entering and finishing?
+
+```{r heatmap, fig.height=8}
+heat <- df %>%
+  filter(!is.na(queue_yr), queue_yr >= 2000) %>%
+  group_by(queue_yr, completion_year) %>%
+  summarise(n = n(), med = median(tiq), .groups = "drop")
+
+ggplot(heat, aes(x = completion_year, y = queue_yr, fill = med / 365.25)) +
+  geom_tile(colour = "white", linewidth = 0.3) +
+  geom_text(aes(label = n), size = 2.5, colour = "white", fontface = "bold") +
+  scale_fill_viridis(option = "magma", name = "Median years\nin queue", direction = -1) +
+  scale_x_continuous(breaks = seq(2000, 2024, 2)) +
+  scale_y_continuous(breaks = seq(2000, 2024, 2)) +
+  coord_equal() +
+  labs(
+    title    = "Queue Entry Year vs Completion Year",
+    subtitle = "Cell label = number of projects. Colour = median queue duration.",
+    x = "Completion year",
+    y = "Queue entry year",
+    caption  = "Lower-right triangle: projects take longer. Upper-left: impossible (complete before entering)."
+  )
+```
+
+---
+
+# 7 - Capacity-Weighted Median
+
+Larger projects may face different queue times. This weights by MW.
+
+```{r capacity-weighted, fig.height=6}
+cw_annual <- df %>%
+  filter(!is.na(mw), mw > 0) %>%
+  group_by(completion_year) %>%
+  summarise(
+    n          = n(),
+    med_days   = median(tiq),
+    wmean_days = weighted.mean(tiq, mw),
+    total_mw   = sum(mw),
+    .groups    = "drop"
+  )
+
+ggplot(cw_annual, aes(x = completion_year)) +
+  geom_line(aes(y = med_days / 365.25, colour = "Unweighted median"),
+            linewidth = 1.1) +
+  geom_line(aes(y = wmean_days / 365.25, colour = "MW-weighted mean"),
+            linewidth = 1.1, linetype = "dashed") +
+  geom_point(aes(y = med_days / 365.25), colour = "#0D47A1", size = 2.5) +
+  geom_point(aes(y = wmean_days / 365.25), colour = "#B71C1C", size = 2.5, shape = 17) +
+  scale_colour_manual(values = c("Unweighted median" = "#0D47A1",
+                                  "MW-weighted mean" = "#B71C1C"),
+                      name = NULL) +
+  scale_x_continuous(breaks = seq(2000, 2024, 2)) +
+  scale_y_continuous(labels = function(x) paste0(x, "y")) +
+  labs(
+    title    = "Unweighted vs Capacity-Weighted Queue Duration",
+    subtitle = "If large projects take longer, the weighted line sits above the unweighted line",
+    x = "Completion year",
+    y = "Years in queue",
+    caption  = "MW-weighted mean uses nameplate capacity as weight"
+  )
+```
+
+---
+
+# 8 - Generation Over Time: Queue Data vs EIA
+
+How much of total US generation does the 17,459-row queue dataset actually capture?
+
+```{r gen-over-time, fig.height=8}
+# EIA ground truth: all generation by year
+eia_raw <- read_csv(
+  file.path(DATA_DIR, "EIA_860_All_Generators.csv"),
+  show_col_types = FALSE
+) %>%
+  mutate(op_year = as.numeric(operating_year),
+         np_mw   = as.numeric(nameplate_mw)) %>%
+  filter(!is.na(op_year), op_year >= 2000, op_year <= 2024, !is.na(np_mw))
+
+eia_annual <- eia_raw %>%
+  group_by(op_year) %>%
+  summarise(gw = sum(np_mw, na.rm = TRUE) / 1000, .groups = "drop") %>%
+  mutate(source = "EIA-860 (all US generators)")
+
+# Queue dataset: completed projects with time_in_queue by resolution year
+queue_annual <- co %>%
+  filter(!is.na(mw), mw > 0) %>%
+  group_by(completion_year) %>%
+  summarise(gw = sum(mw, na.rm = TRUE) / 1000, .groups = "drop") %>%
+  rename(op_year = completion_year) %>%
+  mutate(source = "Queue dataset (completed + TIQ)")
+
+combined <- bind_rows(eia_annual, queue_annual)
+
+ggplot(combined, aes(x = op_year, y = gw, fill = source)) +
+  geom_smooth(position = "dodge", width = 0.7) +
+  geom_text(aes(label = round(gw, 1)),
+            position = position_dodge(0.7), vjust = -0.3,
+            size = 2.5, fontface = "bold") +
+  scale_fill_manual(values = c("EIA-860 (all US generators)" = "#0D47A1",
+                                "Queue dataset (completed + TIQ)" = "#F4A261"),
+                    name = NULL) +
+  scale_x_continuous(breaks = seq(2000, 2024, 2)) +
+  scale_y_continuous(labels = function(x) paste0(x, " GW")) +
+  labs(
+    title    = "New Generation Brought Online: EIA vs Queue Dataset",
+    subtitle = "EIA = ground truth (all US). Queue = only projects with computable time-in-queue.",
+    x = "Year came online",
+    y = "Nameplate capacity (GW)",
+    caption  = "Queue dataset undercounts because: (1) non-ISO states have no queue data,\n(2) many ISO projects lack queue dates, (3) fuzzy matching misses some connections"
+  )
+```
+
+```{r capture-rate, fig.height=6}
+capture <- eia_annual %>%
+  rename(eia_gw = gw) %>%
+  select(op_year, eia_gw) %>%
+  left_join(
+    queue_annual %>% rename(queue_gw = gw) %>% select(op_year, queue_gw),
+    by = "op_year"
+  ) %>%
+  mutate(
+    queue_gw     = replace_na(queue_gw, 0),
+    capture_pct  = 100 * queue_gw / eia_gw,
+    uncaptured   = eia_gw - queue_gw
+  )
+
+ggplot(capture, aes(x = op_year)) +
+  geom_col(aes(y = eia_gw, fill = "Not in queue dataset"), width = 0.7) +
+  geom_col(aes(y = queue_gw, fill = "In queue dataset"), width = 0.7) +
+  geom_line(aes(y = capture_pct / 100 * max(eia_gw)),
+            colour = "black", linewidth = 1, linetype = "dashed") +
+  geom_point(aes(y = capture_pct / 100 * max(eia_gw)),
+             colour = "black", size = 2) +
+  geom_text(aes(y = capture_pct / 100 * max(eia_gw),
+                label = paste0(round(capture_pct), "%")),
+            vjust = -0.8, size = 2.8, fontface = "bold") +
+  scale_fill_manual(values = c("In queue dataset" = "#43AA8B",
+                                "Not in queue dataset" = "#E8E8E8"),
+                    name = NULL) +
+  scale_x_continuous(breaks = seq(2000, 2024, 2)) +
+  scale_y_continuous(labels = function(x) paste0(x, " GW")) +
+  labs(
+    title    = "Queue Dataset Capture Rate vs EIA Total",
+    subtitle = "Dashed line = % of EIA generation represented in the queue dataset with computable TIQ",
+    x = "Year came online",
+    y = "Nameplate capacity (GW)",
+    caption  = "The queue dataset captures a fraction of total US generation because many projects\nlack queue entry dates or are in non-ISO territories with no public queue"
+  )
+```
+
+```{r gen-table}
+capture %>%
+  mutate(
+    eia_gw      = round(eia_gw, 1),
+    queue_gw    = round(queue_gw, 1),
+    uncaptured  = round(uncaptured, 1),
+    capture_pct = round(capture_pct, 1)
+  ) %>%
+  select(op_year, eia_gw, queue_gw, uncaptured, capture_pct) %>%
+  kbl(
+    caption   = "Generation brought online: EIA vs queue dataset",
+    col.names = c("Year", "EIA (GW)", "Queue (GW)", "Gap (GW)", "Capture %")
+  ) %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"), full_width = FALSE) %>%
+  row_spec(0, bold = TRUE)
+```
+
+---
+
+# 9 - All 17,459 Projects: Observations by Year and Outcome
+
+```{r all-17k-bar, fig.height=7}
+obs_annual <- df %>%
+  group_by(completion_year, outcome) %>%
+  summarise(n = n(), .groups = "drop")
+
+ggplot(obs_annual, aes(x = completion_year, y = n, fill = outcome)) +
+  geom_col(width = 0.7) +
+  geom_text(data = obs_annual %>% group_by(completion_year) %>%
+              summarise(total = sum(n), .groups = "drop"),
+            aes(x = completion_year, y = total, label = comma(total), fill = NULL),
+            vjust = -0.3, size = 2.8, fontface = "bold") +
+  scale_fill_manual(values = pal_outcome, name = NULL) +
+  scale_x_continuous(breaks = seq(2000, 2024, 2)) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title    = sprintf("All %s Queue Projects with Computable Duration by Resolution Year",
+                       comma(nrow(df))),
+    subtitle = "Stacked by outcome. Withdrawals dominate in volume.",
+    x = "Year project resolved",
+    y = "Number of projects",
+    caption  = "Only projects with both queue_date and a resolution date (online or withdrawal)"
+  )
+```
+
+---
+
+# 10 - Summary
+
+```{r summary-text, results='asis'}
+early_co <- co %>% filter(completion_year <= 2010) %>% pull(tiq) %>% median()
+late_co  <- co %>% filter(completion_year >= 2018) %>% pull(tiq) %>% median()
+pct_co   <- round(100 * (late_co - early_co) / early_co, 0)
+
+early_wd <- wd %>% filter(completion_year <= 2010) %>% pull(tiq) %>% median()
+late_wd  <- wd %>% filter(completion_year >= 2018) %>% pull(tiq) %>% median()
+pct_wd   <- round(100 * (late_wd - early_wd) / early_wd, 0)
+
+cat(sprintf(
+  "**Came online:** Projects completing in the early period (2000-2010) spent a median of %.0f days (%.1f years) in the queue. In the recent period (2018-2024), that rose to %.0f days (%.1f years) — a %+d%% increase.\n\n",
+  early_co, early_co / 365.25, late_co, late_co / 365.25, pct_co
+))
+
+cat(sprintf(
+  "**Withdrew:** Projects withdrawing in the early period spent a median of %.0f days (%.1f years). In the recent period, %.0f days (%.1f years) — a %+d%% change.\n\n",
+  early_wd, early_wd / 365.25, late_wd, late_wd / 365.25, pct_wd
+))
+
+cat(sprintf(
+  "Dataset: %s completed and %s withdrawn projects with computable queue duration (n = %s total).",
+  comma(nrow(co)), comma(nrow(wd)), comma(nrow(df))
+))
+```
+
+---
+
+*Source: ISO_EIA_Merged_v5.csv (65,203 rows, 17,459 with computable queue duration). Methods: Mann-Kendall, quantile regression, capacity-weighted analysis.*

@@ -1,0 +1,761 @@
+---
+title: "Interconnection Queue Time by Generation Type (2000–2019)"
+subtitle: "How queue durations differ and have changed across technology types"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    code_folding: hide
+    fig_width: 12
+    fig_height: 7
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.align = "center")
+
+pkgs <- c("tidyverse","survival","survminer","quantreg","Kendall",
+          "scales","patchwork","ggridges","knitr","kableExtra","viridis","ggrepel")
+new  <- pkgs[!pkgs %in% installed.packages()[,"Package"]]
+if (length(new)) install.packages(new, repos = "https://cloud.r-project.org", quiet = TRUE)
+
+library(tidyverse); library(survival); library(survminer)
+library(quantreg);  library(Kendall);  library(scales)
+library(patchwork); library(ggridges); library(knitr)
+library(kableExtra);library(viridis);  library(ggrepel)
+```
+
+```{r load-data}
+DATA_DIR <- Sys.getenv("PLANNING_QUEUES_DATA", "../../data")
+df_raw <- read_csv(
+  file.path(DATA_DIR, "TIQ_Analysis_Clean.csv"),
+  show_col_types = FALSE
+)
+
+df <- df_raw %>%
+  mutate(
+    tiq_days  = as.numeric(time_in_queue_days),
+    tiq_years = tiq_days / 365.25,
+    entry_year = as.integer(queue_entry_year),
+    mw        = as.numeric(mw1),
+    outcome   = factor(outcome, levels = c("came_online","withdrew")),
+    tech      = factor(type1),
+    era       = case_when(
+      entry_year %in% 2000:2004 ~ "2000–2004",
+      entry_year %in% 2005:2009 ~ "2005–2009",
+      entry_year %in% 2010:2014 ~ "2010–2014",
+      entry_year %in% 2015:2019 ~ "2015–2019"
+    ),
+    era    = factor(era, levels = c("2000–2004","2005–2009","2010–2014","2015–2019")),
+    decade = ifelse(entry_year <= 2009, "2000–2009", "2010–2019")
+  ) %>%
+  filter(!is.na(tiq_days), !is.na(entry_year))
+
+# Focus techs — sufficient data for trend analysis
+FOCUS_TECHS    <- c("Solar","Wind","Gas","Battery","Coal","Nuclear","Hydro","Offshore Wind")
+TREND_TECHS    <- c("Solar","Wind","Gas","Battery")   # 20 usable years
+SECONDARY_TECHS <- c("Coal","Hydro","Nuclear","Offshore Wind")  # fewer years but meaningful
+
+df_focus <- df %>% filter(tech %in% FOCUS_TECHS) %>%
+  mutate(tech = factor(tech, levels = FOCUS_TECHS))
+
+co <- df_focus %>% filter(outcome == "came_online")
+wd <- df_focus %>% filter(outcome == "withdrew")
+
+# Palettes
+pal_tech <- c(
+  "Solar"         = "#F4A261",
+  "Wind"          = "#43AA8B",
+  "Gas"           = "#E63946",
+  "Battery"       = "#577590",
+  "Coal"          = "#6D4C41",
+  "Nuclear"       = "#9C27B0",
+  "Hydro"         = "#0077B6",
+  "Offshore Wind" = "#00B4D8"
+)
+pal_outcome <- c("came_online" = "#2196F3", "withdrew" = "#FF6B35")
+pal_era     <- c("2000–2004"="#8B0000","2005–2009"="#E85D04",
+                 "2010–2014"="#F4A261","2015–2019"="#2A9D8F")
+
+theme_queue <- theme_minimal(base_size = 12) +
+  theme(
+    plot.title    = element_text(face = "bold", size = 14, margin = margin(b = 5)),
+    plot.subtitle = element_text(colour = "grey40", size = 11, margin = margin(b = 8)),
+    plot.caption  = element_text(colour = "grey55", size = 9, hjust = 0),
+    legend.position  = "bottom",
+    panel.grid.minor = element_blank(),
+    strip.text    = element_text(face = "bold", size = 11)
+  )
+theme_set(theme_queue)
+```
+
+---
+
+# 1 · Technology Overview
+
+```{r tech-overview}
+tech_summary <- df_focus %>%
+  group_by(tech, outcome) %>%
+  summarise(
+    n          = n(),
+    med_days   = round(median(tiq_days)),
+    med_years  = round(median(tiq_days) / 365.25, 1),
+    p25        = round(quantile(tiq_days, .25)),
+    p75        = round(quantile(tiq_days, .75)),
+    mean_mw    = round(mean(mw, na.rm = TRUE)),
+    .groups    = "drop"
+  )
+
+tech_summary %>%
+  mutate(outcome = recode(outcome,
+    "came_online" = "Came Online", "withdrew" = "Withdrew")) %>%
+  arrange(tech, outcome) %>%
+  kbl(
+    caption   = "Queue time summary by technology and outcome",
+    col.names = c("Technology","Outcome","N","Median (days)","Median (years)",
+                  "P25 (days)","P75 (days)","Mean MW")
+  ) %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"), full_width = TRUE) %>%
+  collapse_rows(columns = 1, valign = "middle") %>%
+  row_spec(0, bold = TRUE)
+```
+
+```{r tech-count-bar, fig.height=5}
+df_focus %>%
+  count(tech, outcome) %>%
+  ggplot(aes(x = reorder(tech, n), y = n, fill = outcome)) +
+  geom_col(position = "stack", width = 0.7) +
+  geom_text(aes(label = comma(n)),
+            position = position_stack(vjust = 0.5),
+            colour = "white", fontface = "bold", size = 3.2) +
+  coord_flip() +
+  scale_fill_manual(values = pal_outcome,
+                    labels = c("Came Online","Withdrew")) +
+  scale_y_continuous(labels = comma) +
+  labs(title = "Queue Filings by Technology and Outcome",
+       subtitle = "Solar and Wind dominate; Battery is entirely post-2008",
+       x = NULL, y = "Number of projects", fill = NULL,
+       caption = "Cohorts 2000–2019 with computable queue duration")
+```
+
+```{r tech-median-bar, fig.height=5}
+tech_summary %>%
+  mutate(outcome_lab = recode(outcome,
+    "came_online" = "Came Online", "withdrew" = "Withdrew")) %>%
+  ggplot(aes(x = reorder(tech, med_days), y = med_days / 365.25,
+             fill = tech, alpha = outcome)) +
+  geom_col(position = position_dodge(0.75), width = 0.65) +
+  geom_text(aes(label = paste0(round(med_days / 365.25, 1),"y")),
+            position = position_dodge(0.75), hjust = -0.1,
+            size = 3, fontface = "bold") +
+  coord_flip() +
+  scale_fill_manual(values = pal_tech, guide = "none") +
+  scale_alpha_manual(values = c("came_online" = 1, "withdrew" = 0.45),
+                     labels = c("Came Online","Withdrew"), name = NULL) +
+  scale_y_continuous(labels = function(x) paste0(x,"y"), limits = c(0, 7)) +
+  labs(title = "Median Queue Duration by Technology",
+       subtitle = "Solid = came online · Faded = withdrew",
+       x = NULL, y = "Median years in queue",
+       caption = "Nuclear and Offshore Wind have the longest median durations for successful projects")
+```
+
+---
+
+# 2 · Distribution Shape by Technology
+
+```{r ridge-by-tech, fig.height=9}
+df_focus %>%
+  filter(!is.na(era)) %>%
+  ggplot(aes(x = tiq_days / 365.25,
+             y = fct_rev(factor(tech, levels = FOCUS_TECHS)),
+             fill = tech)) +
+  geom_density_ridges(
+    aes(height = after_stat(density)),
+    alpha = 0.8, scale = 1.6, rel_min_height = 0.01,
+    quantile_lines = TRUE, quantiles = c(0.25, 0.5, 0.75)
+  ) +
+  scale_fill_manual(values = pal_tech, guide = "none") +
+  scale_x_continuous(labels = function(x) paste0(x,"y"),
+                     limits = c(0, 15), breaks = seq(0, 15, 3)) +
+  facet_wrap(~ outcome,
+             labeller = labeller(outcome = c(
+               "came_online" = "Came Online",
+               "withdrew"    = "Withdrew"))) +
+  labs(title = "Full Distribution of Queue Times by Technology",
+       subtitle = "Vertical lines = P25, P50, P75. Each row is one technology.",
+       x = "Years in queue", y = NULL,
+       caption = "Outliers above 15 years excluded for readability")
+```
+
+---
+
+# 3 · Trend Over Time by Technology
+
+## 3.1 Annual Median Trends
+
+```{r annual-trend-facet, fig.height=10}
+annual_tech <- df_focus %>%
+  group_by(tech, outcome, entry_year) %>%
+  summarise(
+    med = median(tiq_days),
+    n   = n(),
+    q25 = quantile(tiq_days, 0.25),
+    q75 = quantile(tiq_days, 0.75),
+    .groups = "drop"
+  ) %>%
+  filter(n >= 5)
+
+ggplot(annual_tech, aes(x = entry_year, y = med / 365.25,
+                         colour = outcome, group = outcome)) +
+  geom_ribbon(aes(ymin = q25 / 365.25, ymax = q75 / 365.25,
+                  fill = outcome, colour = NULL),
+              alpha = 0.12) +
+  geom_line(linewidth = 1) +
+  geom_point(aes(size = n), alpha = 0.75) +
+  geom_smooth(method = "lm", se = FALSE,
+              linewidth = 0.5, linetype = "dashed") +
+  facet_wrap(~ tech, scales = "free_y", ncol = 2) +
+  scale_colour_manual(values = pal_outcome,
+                      labels = c("Came Online","Withdrew")) +
+  scale_fill_manual(values   = pal_outcome, guide = "none") +
+  scale_size_continuous(range = c(1, 5), guide = "none") +
+  scale_x_continuous(breaks = seq(2000, 2019, 5)) +
+  scale_y_continuous(labels = function(x) paste0(x,"y")) +
+  labs(title = "Annual Median Queue Time by Technology and Outcome",
+       subtitle = "Ribbon = IQR. Dashed line = OLS trend. Free y-axis scales.",
+       x = "Queue entry year", y = "Median years in queue",
+       colour = NULL,
+       caption = "Points shown only where n ≥ 5 for that technology × year × outcome")
+```
+
+## 3.2 Era Comparison: 2000s vs 2010s
+
+```{r era-by-tech, fig.height=8}
+era_tech <- df_focus %>%
+  filter(!is.na(decade)) %>%
+  group_by(tech, outcome, decade) %>%
+  summarise(
+    med = median(tiq_days),
+    n   = n(),
+    .groups = "drop"
+  )
+
+# compute % change
+era_wide <- era_tech %>%
+  pivot_wider(names_from = decade, values_from = c(med, n)) %>%
+  rename(med_early = `med_2000–2009`, med_late = `med_2010–2019`,
+         n_early   = `n_2000–2009`,   n_late   = `n_2010–2019`) %>%
+  mutate(pct_change = 100 * (med_late - med_early) / med_early) %>%
+  filter(!is.na(med_early), !is.na(med_late), n_early >= 10, n_late >= 10)
+
+ggplot(era_wide,
+       aes(x = med_early / 365.25, xend = med_late / 365.25,
+           y = reorder(tech, med_early),
+           colour = outcome)) +
+  geom_segment(linewidth = 2.5, alpha = 0.8,
+               arrow = arrow(length = unit(0.25,"cm"), type = "closed")) +
+  geom_point(aes(x = med_early / 365.25), size = 3.5, shape = 21,
+             fill = "white", stroke = 1.5) +
+  geom_text(aes(x = (med_early + med_late) / 2 / 365.25,
+                label = sprintf("%+.0f%%", pct_change)),
+            vjust = -0.8, size = 3.2, fontface = "bold") +
+  facet_wrap(~ outcome,
+             labeller = labeller(outcome = c(
+               "came_online" = "Came Online",
+               "withdrew"    = "Withdrew"))) +
+  scale_colour_manual(values = pal_outcome, guide = "none") +
+  scale_x_continuous(labels = function(x) paste0(x,"y")) +
+  labs(title = "Shift in Median Queue Time: 2000s → 2010s by Technology",
+       subtitle = "Circle = 2000s median. Arrowhead = 2010s median. % = relative change.",
+       x = "Median years in queue", y = NULL,
+       caption = "Only shown where n ≥ 10 in both decades")
+```
+
+---
+
+# 4 · Mann-Kendall Trend Tests by Technology
+
+```{r mk-by-tech}
+mk_rows <- list()
+
+for (tech in FOCUS_TECHS) {
+  for (out in c("came_online","withdrew")) {
+    sub <- df_focus %>%
+      filter(type1 == tech, outcome == out) %>%
+      group_by(entry_year) %>%
+      summarise(med = median(tiq_days), n = n(), .groups = "drop") %>%
+      filter(n >= 5) %>%
+      arrange(entry_year)
+
+    if (nrow(sub) < 6) {
+      mk_rows[[paste(tech, out)]] <- tibble(
+        Technology  = tech,
+        Outcome     = ifelse(out == "came_online","Came Online","Withdrew"),
+        N_years     = nrow(sub),
+        Tau         = NA_real_,
+        P_value     = NA_real_,
+        Direction   = "Insufficient data",
+        Significance= "—"
+      )
+      next
+    }
+
+    mk       <- MannKendall(sub$med)
+    mk_rows[[paste(tech, out)]] <- tibble(
+      Technology   = tech,
+      Outcome      = ifelse(out == "came_online","Came Online","Withdrew"),
+      N_years      = nrow(sub),
+      Tau          = round(mk$tau[1], 3),
+      P_value      = round(mk$sl[1], 4),
+      Direction    = case_when(
+        mk$tau[1] >  0.1 ~ "↑ Increasing",
+        mk$tau[1] < -0.1 ~ "↓ Decreasing",
+        TRUE              ~ "→ Flat"
+      ),
+      Significance = case_when(
+        mk$sl[1] < 0.01 ~ "*** p<0.01",
+        mk$sl[1] < 0.05 ~ "**  p<0.05",
+        mk$sl[1] < 0.10 ~ "*   p<0.10",
+        TRUE             ~ "ns"
+      )
+    )
+  }
+}
+
+mk_tech <- bind_rows(mk_rows)
+
+mk_tech %>%
+  kbl(caption = "Mann-Kendall trend tests by technology and outcome",
+      col.names = c("Technology","Outcome","Years","Tau","P-value",
+                    "Direction","Significance")) %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"), full_width = TRUE) %>%
+  row_spec(which(!is.na(mk_tech$P_value) & mk_tech$P_value < 0.05),
+           background = "#f0f8ff") %>%
+  column_spec(6, bold = TRUE,
+              color = case_when(
+                grepl("↑", mk_tech$Direction) ~ "#1565C0",
+                grepl("↓", mk_tech$Direction) ~ "#B71C1C",
+                TRUE                          ~ "grey50"
+              )) %>%
+  collapse_rows(columns = 1, valign = "middle")
+```
+
+```{r mk-heatmap, fig.height=4.5}
+mk_tech %>%
+  filter(!is.na(Tau)) %>%
+  mutate(
+    sig_label = case_when(
+      P_value < 0.01 ~ "***",
+      P_value < 0.05 ~ "**",
+      P_value < 0.10 ~ "*",
+      TRUE           ~ ""
+    ),
+    cell_label = paste0(round(Tau, 2), sig_label)
+  ) %>%
+  ggplot(aes(x = Outcome,
+             y = factor(Technology, levels = rev(FOCUS_TECHS)),
+             fill = Tau)) +
+  geom_tile(colour = "white", linewidth = 1.5) +
+  geom_text(aes(label = cell_label), fontface = "bold", size = 4) +
+  scale_fill_gradient2(
+    low      = "#B71C1C",
+    mid      = "white",
+    high     = "#1565C0",
+    midpoint = 0,
+    limits   = c(-1, 1),
+    name     = "Kendall's τ\n(blue = increasing)"
+  ) +
+  labs(title = "Mann-Kendall τ Heatmap by Technology and Outcome",
+       subtitle = "Blue = queue times increasing · Red = decreasing · * p<0.1, ** p<0.05, *** p<0.01",
+       x = NULL, y = NULL,
+       caption = "Cells without label = insufficient annual data points (< 6 years)")
+```
+
+---
+
+# 5 · Kaplan-Meier Survival Curves by Technology
+
+> Each panel shows survival curves for the four cohort eras.
+> **Came Online**: downward shift = longer time to completion.
+> **Withdrew**: upward shift = developers holding on longer before giving up.
+
+## 5.1 Came Online
+
+```{r km-co-tech, fig.height=14, fig.width=13}
+km_plots_co <- list()
+
+for (tech in TREND_TECHS) {
+  sub <- co %>%
+    filter(type1 == tech, !is.na(era)) %>%
+    mutate(event = 1)
+
+  if (nrow(sub) < 20) next
+
+  fit <- survfit(Surv(tiq_days, event) ~ era, data = sub)
+
+  p <- ggsurvplot(
+    fit,
+    data          = sub,
+    palette       = unname(pal_era),
+    conf.int      = TRUE,
+    conf.int.alpha= 0.10,
+    pval          = TRUE,
+    pval.coord    = c(3200, 0.92),
+    xlab          = "Days in queue",
+    ylab          = "P(still in queue)",
+    title         = tech,
+    legend        = "none",
+    xlim          = c(0, 3500),
+    break.x.by    = 700,
+    ggtheme       = theme_queue + theme(plot.title = element_text(
+      colour = pal_tech[tech], size = 13))
+  )
+  km_plots_co[[tech]] <- p$plot
+}
+
+wrap_plots(km_plots_co, ncol = 2) +
+  plot_annotation(
+    title    = "Kaplan-Meier: Came Online — by Technology and Era",
+    subtitle = "Downward shift across eras = longer time to reach commercial operation",
+    caption  = "Colours: dark red = 2000–2004 → teal = 2015–2019. Log-rank p-value shown.",
+    theme    = theme(plot.title = element_text(face = "bold", size = 15))
+  )
+```
+
+## 5.2 Withdrew
+
+```{r km-wd-tech, fig.height=14, fig.width=13}
+km_plots_wd <- list()
+
+for (tech in TREND_TECHS) {
+  sub <- wd %>%
+    filter(type1 == tech, !is.na(era)) %>%
+    mutate(event = 1)
+
+  if (nrow(sub) < 20) next
+
+  fit <- survfit(Surv(tiq_days, event) ~ era, data = sub)
+
+  p <- ggsurvplot(
+    fit,
+    data          = sub,
+    palette       = unname(pal_era),
+    conf.int      = TRUE,
+    conf.int.alpha= 0.10,
+    pval          = TRUE,
+    pval.coord    = c(3200, 0.92),
+    xlab          = "Days in queue",
+    ylab          = "P(still in queue)",
+    title         = tech,
+    legend        = "none",
+    xlim          = c(0, 3500),
+    break.x.by    = 700,
+    ggtheme       = theme_queue + theme(plot.title = element_text(
+      colour = pal_tech[tech], size = 13))
+  )
+  km_plots_wd[[tech]] <- p$plot
+}
+
+wrap_plots(km_plots_wd, ncol = 2) +
+  plot_annotation(
+    title    = "Kaplan-Meier: Withdrew — by Technology and Era",
+    subtitle = "Upward shift = projects holding on longer before exiting. Downward shift = faster exit.",
+    caption  = "Colours: dark red = 2000–2004 → teal = 2015–2019.",
+    theme    = theme(plot.title = element_text(face = "bold", size = 15))
+  )
+```
+
+---
+
+# 6 · Quantile Regression by Technology
+
+> Does the trend live in the middle of the distribution or in the tails?
+> Steeper P90 slope vs P50 = the longest projects are getting disproportionately worse.
+
+```{r qr-by-tech, fig.height=10}
+quantiles <- c(0.25, 0.50, 0.75, 0.90)
+qr_tech_preds <- list()
+
+for (tech in TREND_TECHS) {
+  for (out in c("came_online","withdrew")) {
+    sub <- df_focus %>%
+      filter(type1 == tech, outcome == out, tiq_days > 0)
+    if (nrow(sub) < 50) next
+
+    for (q in quantiles) {
+      tryCatch({
+        fit    <- rq(tiq_days ~ entry_year, tau = q, data = sub)
+        s      <- summary(fit, se = "boot", R = 300)
+        coefs  <- as.data.frame(s$coefficients)
+        slope  <- coefs["entry_year","Value"]
+        int    <- coefs["(Intercept)","Value"]
+
+        pred_grid <- tibble(
+          entry_year = 2000:2019,
+          pred       = int + slope * entry_year,
+          quantile   = q,
+          label      = paste0("P", q * 100),
+          tech       = tech,
+          outcome    = out
+        )
+        qr_tech_preds[[paste(tech, out, q)]] <- pred_grid
+      }, error = function(e) NULL)
+    }
+  }
+}
+
+qr_df <- bind_rows(qr_tech_preds) %>%
+  mutate(outcome_lab = recode(outcome,
+    "came_online" = "Came Online", "withdrew" = "Withdrew"))
+
+ggplot(qr_df %>% filter(tech %in% TREND_TECHS),
+       aes(x = entry_year, y = pred / 365.25,
+           colour = factor(label, levels = paste0("P", quantiles * 100)),
+           group  = label)) +
+  geom_line(linewidth = 1.1) +
+  geom_label_repel(
+    data = qr_df %>%
+      filter(tech %in% TREND_TECHS, entry_year == 2019),
+    aes(label = label),
+    nudge_x = 0.6, size = 2.8, fontface = "bold",
+    show.legend = FALSE, min.segment.length = 0.2
+  ) +
+  facet_grid(tech ~ outcome_lab, scales = "free_y") +
+  scale_colour_viridis_d(option = "plasma", name = "Percentile") +
+  scale_x_continuous(breaks = seq(2000, 2019, 5)) +
+  scale_y_continuous(labels = function(x) paste0(x,"y")) +
+  labs(title = "Quantile Regression Fan by Technology and Outcome",
+       subtitle = "Steeper P90 vs P50 = tail projects getting disproportionately longer",
+       x = "Queue entry year", y = "Predicted queue duration",
+       caption = "Fitted via quantile regression with bootstrapped SEs (R=300)")
+```
+
+---
+
+# 7 · Decade Comparison by Technology — Statistical Tests
+
+```{r wilcoxon-tech}
+wx_rows <- list()
+
+for (tech in FOCUS_TECHS) {
+  for (out in c("came_online","withdrew")) {
+    sub <- df_focus %>%
+      filter(type1 == tech, outcome == out)
+
+    early <- sub %>% filter(entry_year <= 2009) %>% pull(tiq_days)
+    late  <- sub %>% filter(entry_year >= 2010) %>% pull(tiq_days)
+
+    if (length(early) < 10 | length(late) < 10) next
+
+    wx <- wilcox.test(early, late, alternative = "two.sided")
+
+    wx_rows[[paste(tech, out)]] <- tibble(
+      Technology = tech,
+      Outcome    = ifelse(out == "came_online","Came Online","Withdrew"),
+      N_2000s    = length(early),
+      N_2010s    = length(late),
+      Med_2000s  = round(median(early)),
+      Med_2010s  = round(median(late)),
+      Pct_Change = round(100 * (median(late) - median(early)) / median(early), 1),
+      P_value    = signif(wx$p.value, 3),
+      Sig        = case_when(
+        wx$p.value < 0.001 ~ "***",
+        wx$p.value < 0.01  ~ "**",
+        wx$p.value < 0.05  ~ "*",
+        wx$p.value < 0.10  ~ ".",
+        TRUE               ~ "ns"
+      )
+    )
+  }
+}
+
+wx_df <- bind_rows(wx_rows)
+
+wx_df %>%
+  arrange(Technology, Outcome) %>%
+  kbl(caption = "Wilcoxon rank-sum test: 2000s vs 2010s median queue times by technology",
+      col.names = c("Technology","Outcome","N 2000s","N 2010s",
+                    "Median 2000s (d)","Median 2010s (d)",
+                    "% Change","P-value","Sig.")) %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"), full_width = TRUE) %>%
+  column_spec(7, bold = TRUE,
+              color = ifelse(wx_df$Pct_Change > 0, "#1565C0", "#B71C1C")) %>%
+  row_spec(which(wx_df$P_value < 0.05), background = "#f0f8ff") %>%
+  collapse_rows(columns = 1, valign = "middle")
+```
+
+---
+
+# 8 · Secondary Technologies
+
+> Coal, Nuclear, Hydro, and Offshore Wind have smaller samples but distinct patterns.
+
+```{r secondary-tech, fig.height=7}
+sec_annual <- df %>%
+  filter(type1 %in% SECONDARY_TECHS) %>%
+  group_by(type1, outcome, entry_year) %>%
+  summarise(med = median(tiq_days), n = n(), .groups = "drop") %>%
+  filter(n >= 5)
+
+ggplot(sec_annual, aes(x = entry_year, y = med / 365.25,
+                        colour = outcome, group = outcome)) +
+  geom_line(linewidth = 1) +
+  geom_point(aes(size = n), alpha = 0.8) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 0.5, linetype = "dashed") +
+  facet_wrap(~ type1, scales = "free_y", ncol = 2) +
+  scale_colour_manual(values = pal_outcome,
+                      labels = c("Came Online","Withdrew")) +
+  scale_size_continuous(range = c(2, 6), guide = "none") +
+  scale_x_continuous(breaks = seq(2000, 2019, 5)) +
+  scale_y_continuous(labels = function(x) paste0(x, "y")) +
+  labs(title = "Queue Time Trends — Secondary Technologies",
+       subtitle = "Smaller samples; interpret directionally. Point size ∝ n.",
+       x = "Queue entry year", y = "Median years in queue",
+       colour = NULL,
+       caption = "Dashed = OLS trend. Free y-axis scales.")
+```
+
+```{r secondary-ridge, fig.height=6}
+df %>%
+  filter(type1 %in% SECONDARY_TECHS, !is.na(era)) %>%
+  mutate(type1 = factor(type1, levels = SECONDARY_TECHS)) %>%
+  ggplot(aes(x = tiq_days / 365.25, y = era, fill = era)) +
+  geom_density_ridges(alpha = 0.75, scale = 1.4, rel_min_height = 0.01,
+                      quantile_lines = TRUE, quantiles = c(0.25, 0.5, 0.75)) +
+  facet_wrap(~ type1, scales = "free_x", ncol = 2) +
+  scale_fill_manual(values = pal_era, guide = "none") +
+  scale_x_continuous(labels = function(x) paste0(x,"y"), limits = c(0, 20)) +
+  labs(title = "Distribution by Era — Secondary Technologies (All Outcomes)",
+       subtitle = "Vertical lines = P25, P50, P75",
+       x = "Years in queue", y = "Cohort era")
+```
+
+---
+
+# 9 · Technology Rankings
+
+```{r rankings, fig.height=6}
+# Rank each technology by: came_online median, withdrew median, success rate
+rank_df <- df_focus %>%
+  group_by(tech) %>%
+  summarise(
+    n_total       = n(),
+    n_co          = sum(outcome == "came_online"),
+    n_wd          = sum(outcome == "withdrew"),
+    success_rate  = n_co / n_total,
+    med_co        = median(tiq_days[outcome == "came_online"], na.rm = TRUE),
+    med_wd        = median(tiq_days[outcome == "withdrew"],    na.rm = TRUE),
+    p90_co        = quantile(tiq_days[outcome == "came_online"], 0.9, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(n_co >= 20)
+
+rank_df %>%
+  mutate(
+    success_pct = paste0(round(100 * success_rate, 1), "%"),
+    med_co_yr   = round(med_co / 365.25, 1),
+    med_wd_yr   = round(med_wd / 365.25, 1),
+    p90_co_yr   = round(p90_co / 365.25, 1)
+  ) %>%
+  arrange(med_co) %>%
+  select(tech, n_total, n_co, success_pct, med_co_yr, med_wd_yr, p90_co_yr) %>%
+  kbl(
+    caption   = "Technology rankings by queue efficiency",
+    col.names = c("Technology","Total N","Came Online","Success Rate",
+                  "Median Online (yrs)","Median Withdrew (yrs)","P90 Online (yrs)")
+  ) %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE) %>%
+  column_spec(4, bold = TRUE,
+              color = ifelse(
+                as.numeric(sub("%","",
+                  arrange(rank_df %>% filter(n_co>=20), med_co)$success_rate * 100)) > 30,
+                "#2e7d32","#c62828")) %>%
+  row_spec(0, bold = TRUE)
+```
+
+```{r success-vs-time, fig.height=5.5}
+rank_df %>%
+  ggplot(aes(x = med_co / 365.25, y = success_rate,
+             colour = tech, size = n_total, label = tech)) +
+  geom_point(alpha = 0.85) +
+  geom_label_repel(size = 3.5, fontface = "bold",
+                   box.padding = 0.4, show.legend = FALSE) +
+  scale_colour_manual(values = pal_tech, guide = "none") +
+  scale_size_continuous(range = c(4, 14),
+                        name = "Total filings",
+                        labels = comma) +
+  scale_x_continuous(labels = function(x) paste0(x,"y")) +
+  scale_y_continuous(labels = percent, limits = c(0, 0.6)) +
+  geom_hline(yintercept = mean(rank_df$success_rate),
+             linetype = "dashed", colour = "grey50") +
+  geom_vline(xintercept = median(rank_df$med_co / 365.25),
+             linetype = "dashed", colour = "grey50") +
+  labs(title = "Technology: Success Rate vs. Time to Come Online",
+       subtitle = "Upper-left = fast and successful · Lower-right = slow and unlikely to complete\nDashed lines = dataset averages",
+       x = "Median years to reach commercial operation",
+       y = "Success rate (came online / total filings)",
+       caption = "Point size proportional to total number of filings")
+```
+
+---
+
+# 10 · Summary by Technology
+
+```{r final-summary}
+summary_tbl <- tribble(
+  ~Technology, ~`Came Online Trend`, ~`Withdrew Trend`, ~`Key Finding`,
+  "Solar",
+    "↓ Decreasing (−16%)",
+    "↓ Decreasing (−24%)",
+    "Both trends declining — improved grid integration + developers exiting faster. Dominates the queue numerically.",
+  "Wind",
+    "→ Flat (−3%)",
+    "↓ Decreasing (−70%)",
+    "Completion time stable; withdrawal time collapsed. Wind developers are giving up far earlier than in the 2000s.",
+  "Gas",
+    "↑ Increasing (+32%) **",
+    "↓ Decreasing (−10%)",
+    "Only technology with a statistically significant and economically large increase in time to come online.",
+  "Battery",
+    "Insufficient data (post-2008)",
+    "→ Flat (+7%)",
+    "Too new for came-online trend. Withdrawal times flat — developers hold on rather than exit early.",
+  "Coal",
+    "↓ Decreasing (−25%)",
+    "→ Flat (+3%)",
+    "Fewer projects overall; recent approvals came online faster. Regulatory pressure may be expediting the few that proceed.",
+  "Nuclear",
+    "↑ Increasing (+17%)",
+    "↓ Decreasing (−64%)",
+    "Small sample (n=46). Longest median came-online time of any technology at 4.2 years.",
+  "Hydro",
+    "↓ Decreasing (−66%)",
+    "↓ Decreasing (−44%)",
+    "Large apparent improvement but very small sample — driven by a few projects.",
+  "Offshore Wind",
+    "Insufficient data (n=1)",
+    "↑ Increasing (+57%)",
+    "Withdrawal times growing — projects are persisting longer before abandonment, reflecting high development costs."
+)
+
+summary_tbl %>%
+  kbl(caption = "Technology-level findings summary") %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = TRUE) %>%
+  column_spec(2, color = ifelse(grepl("↑", summary_tbl$`Came Online Trend`),
+                                "#1565C0", ifelse(grepl("↓", summary_tbl$`Came Online Trend`),
+                                "#B71C1C", "grey40")), bold = TRUE) %>%
+  column_spec(3, color = ifelse(grepl("↑", summary_tbl$`Withdrew Trend`),
+                                "#1565C0", ifelse(grepl("↓", summary_tbl$`Withdrew Trend`),
+                                "#B71C1C", "grey40")), bold = TRUE) %>%
+  row_spec(0, bold = TRUE) %>%
+  row_spec(3, background = "#fff3e0")  # highlight Gas as standout
+```
+
+---
+
+*Analysis: 9,256 queue filings, cohorts 2000–2019. Methods: Mann-Kendall trend test, Wilcoxon rank-sum, Kaplan-Meier survival analysis, quantile regression. See `queue_time_analysis.Rmd` for the full dataset-level analysis.*

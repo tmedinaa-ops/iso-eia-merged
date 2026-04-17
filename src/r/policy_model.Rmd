@@ -1,0 +1,846 @@
+---
+title: "Stage 2 — Policy Model"
+subtitle: "Competing-Risks Duration Model of US Interconnection Queue Outcomes"
+author: "PlanningQueues / Model"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    highlight: tango
+    fig_width: 10
+    fig_height: 5
+    latex_engine: xelatex
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center"
+)
+
+pkgs <- c("tidyverse", "lubridate", "survival", "cmprsk",
+          "broom", "kableExtra", "scales", "patchwork")
+for (p in pkgs) {
+  if (!requireNamespace(p, quietly = TRUE)) install.packages(p, repos = "https://cloud.r-project.org")
+  library(p, character.only = TRUE)
+}
+```
+
+---
+
+# Purpose
+
+This document is **Stage 2 of the policy model pipeline**. It estimates the
+effect of policy levers on US interconnection queue outcomes using a
+competing-risks duration framework. Projects can either come online (event 1)
+or withdraw (event 2); the two are competing failures, not censoring of each
+other. All models are weighted by `ipw_trim` from Stage 1.
+
+**Three objectives, in order of priority:**
+
+1. **Reduce time to come online** — how much faster can projects complete
+   interconnection under different policy regimes?
+2. **Reduce withdrawals** — can more projects survive to completion?
+3. **Maximise MW coming online** — with a preference for green technologies
+   (Solar, Wind, Battery, Offshore Wind).
+
+**Prerequisites:** Run `compute_ipw_weights.Rmd` first. This document reads
+`ipw_weights.csv` from `../../data/` (or `$PLANNING_QUEUES_MODEL_DIR`).
+
+---
+
+# Scope Limitations and IPW Notes
+
+These limitations apply to all results in this document and must be stated in
+any publication or presentation of findings.
+
+## Data coverage
+
+- **ISO-operated queues only.** TVA, Southeast co-ops, Florida municipals, and
+  other non-ISO utilities are excluded. The `iso == "Southeast"` grouping
+  aggregates several smaller ISOs and should be interpreted with caution.
+- **West excluded.** WAPA, BPA, and other West-of-WECC utilities have
+  structurally different reporting practices. The Stage 1 propensity model
+  cannot reliably reweight them (positivity failure: >50% of rows had
+  p_obs < 0.05). West projects are excluded from all weighted analyses.
+- **Entry years before 2008 are unreliable.** ISO queue capture rates are
+  below 50% before 2008. Analyses should be anchored to 2008+ cohorts;
+  2000–2007 data is retained for trend context only.
+- **ERCOT completion dates are sparse.** ERCOT's GIM report is a snapshot only
+  — 124 of 576 completed ERCOT projects have an Actual Completion Date.
+  ERCOT results are included but should be flagged as underestimates.
+
+## IPW limitations
+
+The Stage 1 IPW weights correct for **within-ISO selection bias by technology
+and project size**. They do not — and cannot — correct for the following:
+
+- **Cross-ISO EIA-860 coverage rates.** SPP has a ~5% match rate; MISO ~28%.
+  These low rates reflect EIA-860 data coverage, not within-ISO selection.
+  There is no basis to assume the unmatched SPP/MISO completed projects have
+  different queue time dynamics than the matched 5–28%. IPW cannot reweight
+  across this gap without essentially fabricating data.
+  **Mitigation:** ISO fixed effects in all Stage 2 models absorb cross-ISO
+  composition differences. SPP and MISO results should be treated as lower
+  confidence than PJM, NEISO, NYISO, CAISO.
+- **Unobserved confounders.** Developer financial resources, local permitting
+  difficulty, transmission congestion severity, and interconnection study
+  complexity are not in the data. Residual bias from these factors cannot be
+  eliminated by IPW and should be acknowledged as a limitation.
+- **Weight magnitude.** ISO-stratified IPW weights range from ~0.5 to 2.7
+  (max P99-trimmed). The modest range reflects that within-ISO selection by
+  tech and MW is real but not severe. The weights shift model estimates
+  slightly; they are not driving the results.
+
+```{r ipw-scope-note, echo=FALSE}
+message("IPW scope note printed to console at knit time — see Purpose section.")
+```
+
+---
+
+# 1  Load Data
+
+```{r paths}
+DATA_PATH    <- Sys.getenv(
+  "PLANNING_QUEUES_DATA_V7",
+  "../../data/ISO_EIA_Merged_v7.csv"
+)
+MODEL_DIR    <- Sys.getenv("PLANNING_QUEUES_MODEL_DIR", "../../data")
+WEIGHTS_PATH <- file.path(MODEL_DIR, "ipw_weights.csv")
+OUT_DIR      <- MODEL_DIR
+```
+
+```{r load}
+df_raw  <- read_csv(DATA_PATH,    show_col_types = FALSE)
+weights <- read_csv(WEIGHTS_PATH, show_col_types = FALSE)
+```
+
+```{r engineer}
+df <- df_raw %>%
+  mutate(
+    row_id   = row_number(),
+    tiq_raw  = suppressWarnings(as.numeric(time_in_queue)),
+    has_tiq  = as.integer(!is.na(tiq_raw) & tiq_raw > 0),
+    mw_num   = suppressWarnings(as.numeric(mw)),
+    log_mw   = log1p(mw_num),
+    queue_yr = year(suppressWarnings(as.Date(queue_date))),
+    tech = case_when(
+      str_detect(type1, regex("solar|photovoltaic", ignore_case = TRUE)) ~ "Solar",
+      str_detect(type1, regex("offshore",           ignore_case = TRUE)) ~ "Offshore Wind",
+      str_detect(type1, regex("wind",               ignore_case = TRUE)) ~ "Wind",
+      str_detect(type1, regex("batter|storage",     ignore_case = TRUE)) ~ "Battery",
+      str_detect(type1, regex("natural gas|gas",    ignore_case = TRUE)) ~ "Gas",
+      str_detect(type1, regex("coal",               ignore_case = TRUE)) ~ "Coal",
+      str_detect(type1, regex("nuclear",            ignore_case = TRUE)) ~ "Nuclear",
+      str_detect(type1, regex("hydro",              ignore_case = TRUE)) ~ "Hydro",
+      TRUE                                                                 ~ "Other"
+    ),
+    tech = factor(tech, levels = c("Solar", "Wind", "Battery", "Offshore Wind",
+                                   "Gas", "Coal", "Nuclear", "Hydro", "Other")),
+    iso  = factor(iso),
+
+    # ── Event codes for competing-risks framework ─────────────────────────────
+    # 0 = still in queue (right-censored — no event observed)
+    # 1 = came online    (completion event)
+    # 2 = withdrew       (competing failure)
+    event_code = case_when(
+      status_group == "completed"  ~ 1L,
+      status_group == "withdrawn"  ~ 2L,
+      TRUE                         ~ 0L   # active, eia_only, or unknown
+    ),
+
+    # Duration: use tiq_raw if available; for right-censored rows we still
+    # need a duration — use days from queue_date to the data snapshot.
+    # tiq_raw is in days.
+    tiq_days = tiq_raw
+  )
+```
+
+```{r join-weights}
+# Join weights; rows without weights (West, missing predictors) will have
+# NA ipw_trim and are excluded from weighted models below.
+model_df <- df %>%
+  left_join(weights %>% select(row_id, p_obs, ipw_stab, ipw_trim), by = "row_id") %>%
+  filter(
+    !is.na(ipw_trim),         # must have valid weight
+    iso != "West",            # positivity failure — excluded from all analyses
+    !is.na(tiq_days),
+    tiq_days > 0,
+    !is.na(queue_yr),
+    !is.na(mw_num),
+    !is.na(tech)
+  ) %>%
+  droplevels()
+
+# Restrict to ≥2008 for primary analyses (capture rate < 50% before then)
+model_df_main <- model_df %>% filter(queue_yr >= 2008)
+```
+
+```{r load-summary, echo=FALSE}
+tibble(
+  Metric = c("Total rows in v5", "Rows with valid weights (non-West)",
+             "Rows in primary analysis (≥2008)",
+             "Event 1 — came online", "Event 2 — withdrew",
+             "Event 0 — right-censored"),
+  Value = c(
+    comma(nrow(df_raw)),
+    comma(nrow(model_df)),
+    comma(nrow(model_df_main)),
+    comma(sum(model_df_main$event_code == 1)),
+    comma(sum(model_df_main$event_code == 2)),
+    comma(sum(model_df_main$event_code == 0))
+  )
+) %>%
+  kbl(col.names = c("", ""), booktabs = TRUE,
+      caption = "Dataset summary for Stage 2") %>%
+  kable_styling(latex_options = c("striped", "hold_position"), full_width = FALSE)
+```
+
+---
+
+# 2  Policy Levers
+
+Three levers are constructed. Each captures a distinct regulatory mechanism
+that theory predicts should affect queue duration and withdrawal rates.
+
+## 2.1  Queue Congestion at Entry
+
+A project entering a congested queue faces longer study timelines because
+interconnection studies are processed sequentially (cluster or first-come
+first-served). We measure congestion as the number of projects that were
+**active in the queue** at the time a given project filed — i.e., projects
+that had entered before it and had not yet resolved.
+
+```{r lever-congestion}
+# For each project i with queue entry date d_i:
+# congestion_i = count of projects j where queue_date_j < queue_date_i
+#                and (resolution_date_j > d_i OR resolution_date_j is NA)
+#
+# Approximation: we use queue_yr as entry year and count same-year or
+# earlier-entry projects still in queue at project i's entry year.
+# This is a cohort-level approximation; row-level date matching would require
+# the raw date field which may have quality issues.
+
+congestion_by_yr <- df %>%
+  filter(!is.na(queue_yr)) %>%
+  group_by(queue_yr) %>%
+  summarise(
+    n_entered_that_yr = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(queue_yr) %>%
+  mutate(
+    # Cumulative projects entered through end of prior year = backlog proxy
+    cum_entered_prior = lag(cumsum(n_entered_that_yr), default = 0),
+    # Subtract approximate resolutions: use cumulative completed + withdrawn
+  )
+
+# Join resolved counts to estimate active queue size
+resolved_by_yr <- df %>%
+  filter(!is.na(queue_yr), status_group %in% c("completed", "withdrawn")) %>%
+  group_by(queue_yr) %>%
+  summarise(n_resolved = n(), .groups = "drop")
+
+congestion_tbl <- congestion_by_yr %>%
+  left_join(resolved_by_yr, by = "queue_yr") %>%
+  replace_na(list(n_resolved = 0)) %>%
+  mutate(
+    cum_resolved_prior = lag(cumsum(n_resolved), default = 0),
+    # Active backlog at start of year = cumulative entered - cumulative resolved
+    queue_backlog      = pmax(cum_entered_prior - cum_resolved_prior, 0),
+    # Standardise to mean 0, sd 1 for model interpretability
+    congestion_std     = as.numeric(scale(queue_backlog))
+  ) %>%
+  select(queue_yr, queue_backlog, congestion_std)
+
+model_df_main <- model_df_main %>%
+  left_join(congestion_tbl, by = "queue_yr")
+```
+
+```{r fig-congestion, echo=FALSE, fig.cap="Queue backlog (active projects) at time of entry by cohort year. Sharp growth post-2005 reflects the renewable energy boom. This is the primary policy lever for queue reform analysis.", fig.height=4}
+congestion_tbl %>%
+  filter(queue_yr >= 2000, queue_yr <= 2022) %>%
+  ggplot(aes(x = queue_yr, y = queue_backlog)) +
+  geom_col(fill = "#0077b6", width = 0.8) +
+  scale_y_continuous(labels = comma) +
+  labs(title   = "Queue Backlog at Time of Entry",
+       subtitle = "Number of projects active in queue when a given cohort filed",
+       x = "Queue entry year", y = "Active backlog (projects)") +
+  theme_minimal(base_size = 12)
+```
+
+## 2.2  ISO Reform Adoption
+
+Major ISO queue reforms changed study procedures and cluster processing rules
+at different times. We code a `post_reform` binary for each ISO based on known
+reform adoption years:
+
+| ISO      | Reform event                        | Year |
+|----------|-------------------------------------|------|
+| MISO     | Cluster study introduction          | 2008 |
+| PJM      | FERC Order 2003 full implementation | 2012 |
+| CAISO    | Interconnection process reform      | 2014 |
+| All ISOs | FERC Order 2023 (Large Generator)   | 2023 |
+
+```{r lever-reform}
+iso_reform_yr <- tibble(
+  iso          = c("MISO", "PJM", "CAISO"),
+  reform_yr_iso = c(2008L,  2012L,  2014L)
+)
+
+model_df_main <- model_df_main %>%
+  left_join(iso_reform_yr, by = "iso") %>%
+  mutate(
+    # ISO-specific reform: 1 if project entered after that ISO's reform year
+    post_reform_iso  = as.integer(!is.na(reform_yr_iso) & queue_yr >= reform_yr_iso),
+    # FERC Order 2023 applies universally (will only affect very recent cohorts)
+    post_order2023   = as.integer(queue_yr >= 2023L),
+    # Combined: either ISO reform or Order 2023 in effect
+    post_reform      = as.integer(post_reform_iso == 1 | post_order2023 == 1)
+  )
+```
+
+## 2.3  Technology Era Interactions
+
+Battery storage entered the queue in volume after 2015, coinciding with new
+paired-resource interconnection study requirements. Solar and Wind boom-bust
+cycles create era effects. We construct a `tech_era` variable to interact with
+technology type.
+
+```{r lever-tech-era}
+model_df_main <- model_df_main %>%
+  mutate(
+    era = case_when(
+      queue_yr < 2008              ~ "pre-2008",
+      queue_yr >= 2008 & queue_yr < 2015 ~ "2008-2014",
+      queue_yr >= 2015             ~ "2015+"
+    ),
+    # REPLACED: Removed "pre-2008" so "2008-2014" becomes the reference level
+    era = factor(era, levels = c("2008-2014", "2015+")),
+
+    # Green technology flag — primary policy interest
+    is_green = as.integer(tech %in% c("Solar", "Wind", "Battery", "Offshore Wind"))
+  )
+```
+
+```{r lever-summary, echo=FALSE}
+model_df_main %>%
+  count(era, iso, .drop = FALSE) %>%
+  group_by(era) %>%
+  summarise(
+    ISOs    = n_distinct(iso),
+    Projects = sum(n),
+    .groups = "drop"
+  ) %>%
+  kbl(booktabs = TRUE, caption = "Project counts by technology era") %>%
+  kable_styling(latex_options = c("striped", "hold_position"), full_width = FALSE)
+```
+
+---
+
+# 3  Competing-Risks Model
+
+Projects face two competing failure events: coming online (event 1) and
+withdrawing (event 2). Standard survival analysis treats one as censoring the
+other, which is incorrect — a project that withdraws is not "censored" for
+coming online, it has permanently exited. Competing-risks models handle both
+simultaneously.
+
+**Two complementary approaches:**
+
+- **Cause-specific Cox hazard models** — one model per event type. Coefficients
+  estimate the effect of covariates on the hazard of each specific event,
+  conditioning on not having experienced either event. Best for understanding
+  the mechanisms driving each outcome.
+- **Fine-Gray subdistribution hazard model** — directly models the cumulative
+  incidence function (CIF) for each event. Accounts for the competing risk
+  when estimating the probability of each outcome. Best for policy predictions
+  (e.g., "what fraction of projects will come online within 5 years?").
+
+## 3.1  Cause-Specific Hazard: Completion
+
+```{r cs-completion}
+# Event 1 indicator: came online; withdrew is treated as censored here
+# because we are modelling the hazard of completion specifically.
+cs_df <- model_df_main %>%
+  mutate(
+    event_completion = as.integer(event_code == 1),
+    event_withdrawal = as.integer(event_code == 2)
+  )
+
+cox_completion <- coxph(
+  Surv(tiq_days, event_completion) ~
+    congestion_std + post_reform + is_green +
+    congestion_std:is_green +
+    post_reform:is_green +
+    log_mw + iso + era,
+  data    = cs_df,
+  weights = ipw_trim,
+  ties    = "efron"
+)
+```
+
+```{r cs-completion-table, echo=FALSE}
+tidy(cox_completion, exponentiate = TRUE, conf.int = TRUE) %>%
+  filter(!str_starts(term, "iso"), !str_starts(term, "era")) %>%
+  mutate(
+    HR        = round(estimate,  3),
+    `95% CI`  = paste0("[", round(conf.low, 3), ", ", round(conf.high, 3), "]"),
+    `p-value` = round(p.value, 4),
+    Sig       = case_when(p.value < 0.001 ~ "***",
+                          p.value < 0.01  ~ "**",
+                          p.value < 0.05  ~ "*",
+                          TRUE            ~ "")
+  ) %>%
+  select(Term = term, HR, `95% CI`, `p-value`, Sig) %>%
+  kbl(booktabs = TRUE,
+      caption = "Cause-specific Cox: completion hazard. HR > 1 = faster to come online.") %>%
+  kable_styling(latex_options = c("striped", "hold_position", "scale_down"),
+                full_width = FALSE) %>%
+  row_spec(0, bold = TRUE)
+```
+
+## 3.2  Cause-Specific Hazard: Withdrawal
+
+```{r cs-withdrawal}
+cox_withdrawal <- coxph(
+  Surv(tiq_days, event_withdrawal) ~
+    congestion_std + post_reform + is_green +
+    congestion_std:is_green +
+    post_reform:is_green +
+    log_mw + iso + era,
+  data    = cs_df,
+  weights = ipw_trim,
+  ties    = "efron"
+)
+```
+
+```{r cs-withdrawal-table, echo=FALSE}
+tidy(cox_withdrawal, exponentiate = TRUE, conf.int = TRUE) %>%
+  filter(!str_starts(term, "iso"), !str_starts(term, "era")) %>%
+  mutate(
+    HR        = round(estimate,  3),
+    `95% CI`  = paste0("[", round(conf.low, 3), ", ", round(conf.high, 3), "]"),
+    `p-value` = round(p.value, 4),
+    Sig       = case_when(p.value < 0.001 ~ "***",
+                          p.value < 0.01  ~ "**",
+                          p.value < 0.05  ~ "*",
+                          TRUE            ~ "")
+  ) %>%
+  select(Term = term, HR, `95% CI`, `p-value`, Sig) %>%
+  kbl(booktabs = TRUE,
+      caption = "Cause-specific Cox: withdrawal hazard. HR > 1 = faster to withdraw.") %>%
+  kable_styling(latex_options = c("striped", "hold_position", "scale_down"),
+                full_width = FALSE) %>%
+  row_spec(0, bold = TRUE)
+```
+
+## 3.3  Subdistribution Hazard (Fine-Gray)
+
+The Fine-Gray model gives the subdistribution hazard, which directly maps to
+the cumulative incidence function — the probability of experiencing each event
+by time t in the presence of competing risks.
+
+```{r fine-gray}
+# Convert numeric event_code to a factor for the survival package
+cs_df <- cs_df %>%
+  mutate(event_factor = factor(event_code, levels = c(0, 1, 2), 
+                               labels = c("censored", "online", "withdrew")))
+
+# ── Completion (event = "online") ─────────────────────────────────────────────
+fgdata_online <- finegray(
+  Surv(tiq_days, event_factor) ~ congestion_std + post_reform + is_green +
+    log_mw + iso + era,
+  data    = cs_df,
+  weights = ipw_trim,      
+  etype   = "online"       # Now matches the factor label
+)
+
+fg_completion <- tryCatch(
+  coxph(
+    Surv(fgstart, fgstop, fgstatus) ~
+      congestion_std + post_reform + is_green +
+      congestion_std:is_green + post_reform:is_green +
+      log_mw + iso + era,
+    data    = fgdata_online,
+    weights = fgwt         
+  ),
+  error = function(e) { message("Fine-Gray completion failed: ", e$message); NULL }
+)
+
+# ── Withdrawal (event = "withdrew") ───────────────────────────────────────────
+fgdata_withdrew <- finegray(
+  Surv(tiq_days, event_factor) ~ congestion_std + post_reform + is_green +
+    log_mw + iso + era,
+  data    = cs_df,
+  weights = ipw_trim,      
+  etype   = "withdrew"     # Now matches the factor label
+)
+
+fg_withdrawal <- tryCatch(
+  coxph(
+    Surv(fgstart, fgstop, fgstatus) ~
+      congestion_std + post_reform + is_green +
+      congestion_std:is_green + post_reform:is_green +
+      log_mw + iso + era,
+    data    = fgdata_withdrew,
+    weights = fgwt         
+  ),
+  error = function(e) { message("Fine-Gray withdrawal failed: ", e$message); NULL }
+)
+```
+
+```{r fine-gray-table, echo=FALSE}
+# Helper: tidy a coxph Fine-Gray fit into the summary table format,
+# or return an informative placeholder row if the model failed.
+format_fg <- function(fit, label) {
+  if (is.null(fit)) {
+    return(tibble(Model = label, Term = "Model failed — see console",
+                  SHR = NA_real_, `p-value` = NA_real_))
+  }
+  tidy(fit, exponentiate = TRUE, conf.int = FALSE) %>%
+    transmute(
+      Model     = label,
+      Term      = term,
+      SHR       = round(estimate, 3),
+      `p-value` = round(p.value, 4)
+    )
+}
+
+bind_rows(
+  format_fg(fg_completion, "Completion (event 1)"),
+  format_fg(fg_withdrawal, "Withdrawal (event 2)")
+) %>%
+  filter(!str_starts(Term, "iso"), !str_starts(Term, "era")) %>%
+  select(Model, Term, SHR, `p-value`) %>%
+  kbl(booktabs = TRUE,
+      caption = "Fine-Gray subdistribution hazard ratios (via finegray + coxph). SHR > 1 = higher CIF for that event.") %>%
+  kable_styling(latex_options = c("striped", "hold_position", "scale_down"),
+                full_width = FALSE) %>%
+  row_spec(0, bold = TRUE)
+```
+
+## 3.4  Cause-Specific Hazard Ratios — Visual Comparison
+
+```{r fig-cs-comparison, echo=FALSE, fig.cap="Cause-specific hazard ratios for policy levers and green technology interactions. Bars to the right of 1.0 (completion) indicate faster completion; bars to the right of 1.0 (withdrawal) indicate faster exit.", fig.height=5}
+tidy_completion <- tidy(cox_completion, exponentiate = TRUE, conf.int = TRUE) %>%
+  filter(!str_starts(term, "iso"), !str_starts(term, "era")) %>%
+  mutate(model = "Completion hazard")
+
+tidy_withdrawal <- tidy(cox_withdrawal, exponentiate = TRUE, conf.int = TRUE) %>%
+  filter(!str_starts(term, "iso"), !str_starts(term, "era")) %>%
+  mutate(model = "Withdrawal hazard")
+
+bind_rows(tidy_completion, tidy_withdrawal) %>%
+  mutate(
+    model = factor(model, levels = c("Completion hazard", "Withdrawal hazard")),
+    term  = str_replace_all(term, "_", " ")
+  ) %>%
+  ggplot(aes(x = estimate, y = reorder(term, estimate),
+             colour = model, shape = model)) +
+  geom_point(size = 3) +
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high), height = 0.2) +
+  geom_vline(xintercept = 1, linetype = "dashed", colour = "grey40") +
+  scale_colour_manual(values = c("Completion hazard" = "#0077b6",
+                                 "Withdrawal hazard"  = "#e63946")) +
+  facet_wrap(~model, scales = "free_x") +
+  labs(title  = "Cause-Specific Hazard Ratios — Policy Levers",
+       x = "Hazard Ratio (95% CI)", y = NULL,
+       colour = NULL, shape = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "none")
+```
+
+---
+
+# 4  Parametric AFT Model (Time to Online)
+
+The Cox model gives relative hazards but no absolute time predictions. A
+parametric accelerated failure time (AFT) model provides interpretable
+predictions: "under this policy lever, projects come online X days faster."
+We restrict to **completion events only** and treat withdrawals as censored.
+
+**Distribution selection:** Log-normal is preferred for interconnection queue
+times — the distribution is right-skewed with a long tail (some projects take
+10+ years) but not monotonically hazardous.
+
+```{r aft-fit}
+aft_df <- cs_df %>%
+  filter(event_code %in% c(0L, 1L)) %>%
+  droplevels()   # remove empty factor levels (e.g. era "pre-2008" has zero rows
+                 # because model_df_main is already filtered to queue_yr >= 2008;
+                 # any NA coefficient from an empty level propagates to all predictions)
+# event_code 2 (withdrew) is right-censored here — we observe they left but
+# not when they would have come online had they stayed.
+
+aft_lognormal <- survreg(
+  Surv(tiq_days, event_completion) ~
+    congestion_std + post_reform + is_green +
+    congestion_std:is_green +
+    post_reform:is_green +
+    log_mw + iso + era,
+  data    = aft_df,
+  weights = ipw_trim,
+  dist    = "lognormal"
+)
+
+aft_weibull <- survreg(
+  Surv(tiq_days, event_completion) ~
+    congestion_std + post_reform + is_green +
+    congestion_std:is_green +
+    post_reform:is_green +
+    log_mw + iso + era,
+  data    = aft_df,
+  weights = ipw_trim,
+  dist    = "weibull"
+)
+```
+
+```{r aft-model-selection, echo=FALSE}
+tibble(
+  Distribution = c("Log-normal", "Weibull"),
+  LogLik       = c(round(logLik(aft_lognormal), 1),
+                   round(logLik(aft_weibull),   1)),
+  AIC          = c(round(AIC(aft_lognormal), 1),
+                   round(AIC(aft_weibull),   1))
+) %>%
+  kbl(booktabs = TRUE, caption = "AFT model fit comparison. Lower AIC = better fit.") %>%
+  kable_styling(latex_options = c("striped", "hold_position"), full_width = FALSE) %>%
+  row_spec(0, bold = TRUE)
+```
+
+```{r aft-table, echo=FALSE}
+# AFT coefficients: exp(coef) is the time ratio — values < 1 mean faster
+tidy(aft_lognormal, conf.int = TRUE) %>%
+  filter(!str_starts(term, "iso"), !str_starts(term, "era"),
+         term != "Log(scale)") %>%
+  mutate(
+    `Time ratio`  = round(exp(estimate), 3),
+    `95% CI`      = paste0("[", round(exp(conf.low), 3), ", ",
+                            round(exp(conf.high), 3), "]"),
+    `p-value`     = round(p.value, 4),
+    Interpretation = case_when(
+      exp(estimate) < 1 ~ paste0(round((1 - exp(estimate)) * 100, 1), "% faster"),
+      exp(estimate) > 1 ~ paste0(round((exp(estimate) - 1) * 100, 1), "% slower"),
+      TRUE              ~ "no effect"
+    ),
+    Sig = case_when(p.value < 0.001 ~ "***",
+                    p.value < 0.01  ~ "**",
+                    p.value < 0.05  ~ "*",
+                    TRUE            ~ "")
+  ) %>%
+  select(Term = term, `Time ratio`, `95% CI`, `p-value`, Sig, Interpretation) %>%
+  kbl(booktabs = TRUE,
+      caption = "Log-normal AFT model (time to online). Time ratio < 1 = faster completion.") %>%
+  kable_styling(latex_options = c("striped", "hold_position", "scale_down"),
+                full_width = FALSE) %>%
+  row_spec(0, bold = TRUE)
+```
+
+## 4.1  Predicted Completion Time Under Policy Scenarios
+
+Using the log-normal AFT, we predict median completion time for a reference
+project under three scenarios:
+
+- **Baseline:** mean congestion, no ISO reform, green technology (Solar 100 MW, PJM, 2008–2014 era)
+- **Reform:** same as baseline but `post_reform = 1`
+- **Low congestion:** congestion reduced by 1 SD (−1 from mean)
+
+```{r aft-scenarios}
+# iso and era passed as strings — predict.survreg coerces to match training
+# factor levels automatically, avoiding factor/level mismatch issues.
+ref_project <- tibble(
+  congestion_std = c(0,  0, -1),
+  post_reform    = c(0L, 1L, 0L),
+  is_green       = c(1L, 1L, 1L),
+  log_mw         = log1p(100),
+  iso            = "PJM",
+  era            = "2008-2014",
+  Scenario       = c("Baseline", "Post-reform", "Low congestion (−1 SD)")
+)
+
+# predict.survreg with type = "quantile" returns a matrix; as.numeric() flattens
+# it to a plain vector so dplyr and kbl handle it correctly.
+ref_project <- ref_project %>%
+  mutate(
+    median_days  = as.numeric(predict(aft_lognormal, newdata = as.data.frame(ref_project),
+                                      type = "quantile", p = 0.5)),
+    median_years = round(median_days / 365.25, 2)
+  )
+```
+
+```{r aft-scenario-table, echo=FALSE}
+ref_project %>%
+  select(Scenario, `Median TIQ (days)` = median_days,
+         `Median TIQ (years)` = median_years) %>%
+  mutate(`Median TIQ (days)` = round(`Median TIQ (days)`, 0)) %>%
+  kbl(booktabs = TRUE,
+      caption = "Predicted median time-to-online under three policy scenarios. Reference: Solar 100 MW, PJM, 2008–2014 era.") %>%
+  kable_styling(latex_options = c("striped", "hold_position"), full_width = FALSE) %>%
+  row_spec(0, bold = TRUE)
+```
+
+
+---
+
+# 5  Capacity-Weighted Outcomes (MW Objective)
+
+The MW objective requires weighting predicted outcomes by project capacity.
+A policy that accelerates 10 × 100 MW Solar projects is more valuable than
+one that accelerates 100 × 10 MW Gas projects.
+
+## 5.1  Predicted Completion Probability by Technology
+
+Using the Fine-Gray completion model, we predict the 5-year cumulative
+incidence of completion for each technology at mean congestion, post-reform.
+
+```{r mw-setup}
+# For MW-weighted analysis, use the cause-specific completion hazard
+# and predict at fixed covariate values varying only by technology.
+
+tech_levels <- levels(cs_df$tech)
+
+tech_scenarios <- tibble(
+  tech           = factor(tech_levels, levels = tech_levels),
+  congestion_std = 0,
+  post_reform    = 1L,
+  is_green       = as.integer(tech_levels %in% c("Solar", "Wind", "Battery", "Offshore Wind")),
+  log_mw         = log1p(100),
+  iso            = "PJM",    # FIXED: Passed as string to avoid factor NA bugs
+  era            = "2015+"   # FIXED: Passed as string to avoid factor NA bugs
+)
+```
+
+## 5.2  MW-Weighted Scenario Analysis
+
+For each technology, we compute: expected MW online within 5 years =
+predicted completion probability × nameplate MW in queue.
+
+```{r mw-weighted}
+# Mean MW by technology (in full dataset)
+mw_by_tech <- model_df_main %>%
+  filter(!is.na(mw_num)) %>%
+  group_by(tech) %>%
+  summarise(
+    total_mw   = sum(mw_num, na.rm = TRUE),
+    n_projects = n(),
+    mean_mw    = mean(mw_num, na.rm = TRUE),
+    .groups    = "drop"
+  )
+
+# Predicted median completion time from AFT (type = "quantile", p = 0.5)
+# Returns median in days directly; derive log_median_days for the pnorm step.
+tech_scenarios <- tech_scenarios %>%
+  mutate(
+    # FIXED: Added as.numeric() to flatten the matrix returned by predict!
+    # Without this, predict returns a 2D matrix which dplyr cannot display in a table.
+    median_days     = as.numeric(predict(aft_lognormal, newdata = as.data.frame(tech_scenarios),
+                                         type = "quantile", p = 0.5)),
+    log_median_days = log(median_days),   # log-median = Xβ; needed for pnorm CDF
+    median_years    = round(median_days / 365.25, 2)
+  ) %>%
+  left_join(mw_by_tech, by = "tech") %>%
+  mutate(
+    # P(T < 5yr | log-normal) = pnorm((log(5*365.25) - log_median_days) / aft_lognormal$scale)
+    p_complete_5yr  = pnorm(
+      (log(5 * 365.25) - log_median_days) / aft_lognormal$scale
+    ),
+    mw_expected_5yr = p_complete_5yr * total_mw / 1e3  # GW
+  )
+```
+
+```{r mw-table, echo=FALSE}
+tech_scenarios %>%
+  arrange(desc(mw_expected_5yr)) %>%
+  mutate(
+    is_green    = ifelse(is_green == 1, "Yes", "No"),
+    median_years = round(median_years, 2),
+    p_complete_5yr = paste0(round(100 * p_complete_5yr, 1), "%"),
+    mw_expected_5yr = round(mw_expected_5yr, 1),
+    total_mw    = round(total_mw / 1e3, 1)
+  ) %>%
+  select(Technology = tech, Green = is_green,
+         `Median TIQ (yr)` = median_years,
+         `P(complete ≤5yr)` = p_complete_5yr,
+         `Total MW in queue (GW)` = total_mw,
+         `Expected GW online ≤5yr` = mw_expected_5yr) %>%
+  kbl(booktabs = TRUE,
+      caption = "Capacity-weighted completion forecast (post-reform, PJM reference, 2015+ era). Expected GW online = P(complete ≤5yr) × total queue MW.") %>%
+  kable_styling(latex_options = c("striped", "hold_position", "scale_down"),
+                full_width = FALSE) %>%
+  row_spec(which(tech_scenarios %>% arrange(desc(mw_expected_5yr)) %>% pull(is_green) == 1),
+           bold = TRUE) %>%
+  row_spec(0, bold = TRUE)
+```
+
+```{r fig-mw-outcomes, echo=FALSE, fig.cap="Expected GW online within 5 years by technology (post-reform scenario). Bold = green technology. Height reflects both completion probability and total MW in queue.", fig.height=4}
+tech_scenarios %>%
+  arrange(desc(mw_expected_5yr)) %>%
+  mutate(
+    tech   = factor(tech, levels = rev(tech)),
+    colour = ifelse(is_green == 1, "#43AA8B", "#adb5bd")
+  ) %>%
+  ggplot(aes(x = mw_expected_5yr, y = tech, fill = factor(is_green))) +
+  geom_col(width = 0.7) +
+  scale_fill_manual(values = c("0" = "#adb5bd", "1" = "#43AA8B"),
+                    labels = c("0" = "Conventional", "1" = "Green"),
+                    name = NULL) +
+  scale_x_continuous(labels = comma) +
+  labs(title    = "Expected GW Online Within 5 Years by Technology",
+       subtitle = "Post-reform scenario, PJM reference, 2015+ era. Green = Solar/Wind/Battery/Offshore.",
+       x = "Expected GW online (≤5yr)", y = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+```
+
+---
+
+# 6  Summary
+
+```{r summary-table, echo=FALSE}
+# Pull key coefficients for the summary
+hr_congestion_completion <- round(exp(coef(cox_completion)["congestion_std"]), 3)
+hr_reform_completion     <- round(exp(coef(cox_completion)["post_reform"]), 3)
+hr_green_completion      <- round(exp(coef(cox_completion)["is_green"]), 3)
+
+hr_congestion_withdrawal <- round(exp(coef(cox_withdrawal)["congestion_std"]), 3)
+hr_reform_withdrawal     <- round(exp(coef(cox_withdrawal)["post_reform"]), 3)
+hr_green_withdrawal      <- round(exp(coef(cox_withdrawal)["is_green"]), 3)
+
+tr_congestion <- round(exp(coef(aft_lognormal)["congestion_std"]), 3)
+tr_reform     <- round(exp(coef(aft_lognormal)["post_reform"]), 3)
+tr_green      <- round(exp(coef(aft_lognormal)["is_green"]), 3)
+
+tibble(
+  Lever = c("Queue congestion (+1 SD)",
+            "Post ISO reform",
+            "Green technology"),
+  `Completion HR` = c(hr_congestion_completion, hr_reform_completion, hr_green_completion),
+  `Withdrawal HR` = c(hr_congestion_withdrawal, hr_reform_withdrawal, hr_green_withdrawal),
+  `AFT time ratio` = c(tr_congestion, tr_reform, tr_green)
+) %>%
+  kbl(booktabs = TRUE,
+      caption = "Key policy lever estimates across all three model frameworks. HR > 1 = higher hazard; time ratio < 1 = faster completion.") %>%
+  kable_styling(latex_options = c("striped", "hold_position"), full_width = FALSE) %>%
+  row_spec(0, bold = TRUE)
+```
+
+**Scope and confidence notes:**
+
+- All models include ISO and era fixed effects. Estimates are identified from
+  within-ISO, within-era variation in policy levers and project characteristics.
+- SPP and MISO carry lower confidence due to EIA-860 coverage limitations
+  (5% and 28% match rates). Excluding SPP and MISO and rerunning is a
+  recommended robustness check.
+- The congestion lever is a cohort-year approximation. A more precise
+  measure would use project-level entry dates to count active queue members
+  at the exact moment of filing.
+- Residual confounding from unobserved factors (developer resources, local
+  permitting, transmission congestion severity) cannot be ruled out.
+
+---
+
+*Generated: `r Sys.Date()` | Data: `ISO_EIA_Merged_v7.csv` | Stage 2 of PlanningQueues policy model pipeline*

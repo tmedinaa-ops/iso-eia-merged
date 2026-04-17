@@ -1,0 +1,499 @@
+---
+title: "Stage 1 — IPW Weights"
+subtitle: "Inverse Probability Weighting for the PlanningQueues Policy Model"
+author: "PlanningQueues / Model"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    highlight: tango
+    fig_width: 10
+    fig_height: 5
+    latex_engine: xelatex
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center"
+)
+
+pkgs <- c("tidyverse", "lubridate", "broom", "pROC", "kableExtra", "scales", "patchwork")
+for (p in pkgs) {
+  if (!requireNamespace(p, quietly = TRUE)) install.packages(p, repos = "https://cloud.r-project.org")
+  library(p, character.only = TRUE)
+}
+```
+
+---
+
+# Purpose
+
+This document is **Stage 1 of the policy model pipeline**. It fits a logistic
+model predicting which rows in `ISO_EIA_Merged_v7.csv` have a computable
+time-in-queue (TIQ), then produces stabilised inverse probability weights that
+correct for the systematic selection bias identified in the missingness
+mechanism analysis (AUC = 0.70+, IPW slope divergence = -19.6%).
+
+Every duration model, survival model, and competing-risks model in Stage 2
+must use the weights produced here. Rerun this document whenever v5 is updated.
+
+**v2 changes (2026-03-31):** Two fixes informed by `ipw_weight_validation.Rmd`:
+
+1. `iso == "West"` excluded — positivity failure (>50% of West rows had
+   p_obs < 0.05 in v1). West utilities have structurally different reporting
+   practices; IPW extrapolates rather than corrects for them. Treat as scope
+   limitation in all downstream analyses.
+2. `iso * queue_yr` interaction added to propensity model — different ISOs
+   underwent queue reforms at different times, so observability trends differ
+   by ISO. The v1 model's single `queue_yr` coefficient overcorrected the
+   time trend (−87.4% slope divergence vs. the expected −19.6%), because it
+   conflated selection bias with the trend itself.
+
+**v3 changes (2026-04-01):** Two structural fixes informed by root-cause
+diagnosis of the persistent overcorrection (−90.4% slope divergence in v2):
+
+1. **Propensity model training restricted to resolved projects only**
+   (`status_group %in% c("came_online", "withdrew")`). The selection bias
+   being corrected is: among resolved projects with a known outcome, which
+   ones got successfully matched to an EIA completion date? Still-in-queue
+   projects have missing TIQ because they haven't resolved yet — that is
+   right-censoring, not selection. Including them in the propensity model
+   mixes censoring with selection and produces weights that partially
+   "correct" for the passage of time rather than for reporting differences.
+2. **`queue_yr` removed from propensity formula** → `has_tiq ~ iso + tech + log_mw`.
+   Even after restricting to resolved projects, `queue_yr` is both a predictor
+   in the propensity model and the covariate driving the trend being estimated
+   in Stage 2. Including it makes the IPW partial out year effects before
+   Stage 2 can estimate them — causing the −90% overcorrection seen in v2.
+   ISO and technology capture the cross-sectional selection differences that
+   IPW needs to correct; time trend estimation belongs in Stage 2, not Stage 1.
+   West exclusion from v2 is retained.
+
+**Outputs written to `../../data/` (or `$PLANNING_QUEUES_MODEL_DIR` if set):**
+
+- `ipw_weights.csv` — one row per model-eligible input row; join to Stage 2 data on `row_id`
+- `ipw_model.rds` — saved logistic model object for inspection and reuse
+
+---
+
+# 1  Load Data
+
+```{r load}
+DATA_PATH   <- Sys.getenv(
+  "PLANNING_QUEUES_DATA_V7",
+  "../../data/ISO_EIA_Merged_v7.csv"
+)
+MODEL_DIR   <- Sys.getenv("PLANNING_QUEUES_MODEL_DIR", "../../data")
+OUT_WEIGHTS <- file.path(MODEL_DIR, "ipw_weights.csv")
+OUT_MODEL   <- file.path(MODEL_DIR, "ipw_model.rds")
+
+df_raw <- read_csv(DATA_PATH, show_col_types = FALSE)
+```
+
+```{r load-summary, echo=FALSE}
+tibble(
+  Metric = c("Total rows", "Total columns"),
+  Value  = c(comma(nrow(df_raw)), ncol(df_raw))
+) %>%
+  kbl(col.names = c("", ""), booktabs = TRUE) %>%
+  kable_styling(latex_options = c("hold_position"), full_width = FALSE)
+```
+
+---
+
+# 2  Feature Engineering
+
+Feature definitions are kept identical to `missingness_mechanism_analysis.Rmd`
+so the weights are computed on exactly the same variable specifications.
+
+```{r engineer}
+df <- df_raw %>%
+  mutate(
+    row_id  = row_number(),
+
+    # Missingness flag — outcome of the stage-1 logistic model
+    tiq_raw = suppressWarnings(as.numeric(time_in_queue)),
+    has_tiq = as.integer(!is.na(tiq_raw) & tiq_raw > 0),
+
+    # Capacity
+    mw_num  = suppressWarnings(as.numeric(mw)),
+    log_mw  = log1p(mw_num),
+
+    # Queue entry year
+    queue_yr = year(suppressWarnings(as.Date(queue_date))),
+
+    # Technology — consistent with all other pipeline scripts
+    tech = case_when(
+      str_detect(type1, regex("solar|photovoltaic", ignore_case = TRUE))  ~ "Solar",
+      str_detect(type1, regex("offshore",           ignore_case = TRUE))  ~ "Offshore Wind",
+      str_detect(type1, regex("wind",               ignore_case = TRUE))  ~ "Wind",
+      str_detect(type1, regex("batter|storage",     ignore_case = TRUE))  ~ "Battery",
+      str_detect(type1, regex("natural gas|gas",    ignore_case = TRUE))  ~ "Gas",
+      str_detect(type1, regex("coal",               ignore_case = TRUE))  ~ "Coal",
+      str_detect(type1, regex("nuclear",            ignore_case = TRUE))  ~ "Nuclear",
+      str_detect(type1, regex("hydro",              ignore_case = TRUE))  ~ "Hydro",
+      TRUE                                                                  ~ "Other"
+    ),
+    tech = factor(tech),
+    iso  = factor(iso)
+  )
+```
+
+```{r engineer-summary, echo=FALSE}
+tibble(
+  Group   = c("Has computable TIQ", "Missing TIQ", "Missing rate"),
+  Value   = c(
+    comma(sum(df$has_tiq)),
+    comma(sum(df$has_tiq == 0)),
+    paste0(round(100 * mean(df$has_tiq == 0), 1), "%")
+  )
+) %>%
+  kbl(col.names = c("", ""), booktabs = TRUE,
+      caption = "TIQ availability in full dataset") %>%
+  kable_styling(latex_options = c("striped", "hold_position"), full_width = FALSE)
+```
+
+---
+
+# 3  Fit Logistic Model
+
+The model predicts `has_tiq` — whether a row has a computable TIQ — from ISO,
+technology, log(MW), and queue entry year. Rows with missing predictors are
+excluded explicitly here rather than relying on `glm`'s silent dropping, which
+would cause length mismatches in downstream `predict()` calls.
+
+```{r model-filter}
+# v3: Training set restricted to RESOLVED projects only.
+# The selection being corrected is: among projects with a known outcome
+# (came_online or withdrew), which ones were successfully matched to an EIA
+# completion date? Still-in-queue projects are right-censored — they have
+# missing TIQ because they haven't resolved yet, not because of reporting
+# differences. Including them in the propensity model conflates censoring
+# with selection bias and causes the IPW to upweight recent unresolved rows,
+# partially removing the time trend that Stage 2 is meant to estimate.
+#
+# iso == "West" remains excluded: positivity failure retained from v2
+# (>50% of West rows had p_obs < 0.05). West utilities have structurally
+# different reporting practices; treat as scope limitation in Stage 2.
+model_df <- df %>%
+  filter(
+    status_group %in% c("completed", "withdrawn"), # <-- Updated to match v5 data
+    !is.na(iso),
+    !is.na(tech),
+    !is.na(log_mw),
+    iso != "West"
+  ) %>%
+  droplevels()
+```
+
+```{r model-filter-check, echo=TRUE}
+# ── Diagnostic: verify filter produced a usable training set ─────────────────
+cat("status_group values in raw data:\n")
+print(sort(table(df$status_group, useNA = "ifany")))
+
+cat("\nRows in model_df after filter:", nrow(model_df), "\n")
+
+cat("\niso levels in model_df:\n")
+print(levels(model_df$iso))
+
+cat("\ntech levels in model_df:\n")
+print(levels(model_df$tech))
+
+# Safety check — stop early with a clear message rather than a cryptic glm error
+stopifnot(
+  "model_df is empty — check status_group filter values above" = nrow(model_df) > 0,
+  "iso has fewer than 2 levels after filtering" = nlevels(model_df$iso) >= 2,
+  "tech has fewer than 2 levels after filtering" = nlevels(model_df$tech) >= 2
+)
+```
+
+```{r model-fit}
+# v3 formula: has_tiq ~ iso + tech + log_mw
+# queue_yr is intentionally excluded. Even with the training set restricted
+# to resolved projects, including queue_yr in the propensity model would
+# partial out year effects in the weights before Stage 2 can estimate them —
+# because queue_yr is both a predictor here and the covariate driving the
+# trend in Stage 2. ISO and technology capture the cross-sectional selection
+# differences that IPW needs to correct (SPP ~5% match rate, MISO ~40%).
+# Estimating the time trend is Stage 2's job, not Stage 1's.
+logit_mod <- glm(
+  has_tiq ~ iso + tech + log_mw,
+  data   = model_df,
+  family = binomial(link = "logit")
+)
+
+logit_null <- glm(has_tiq ~ 1, data = model_df, family = binomial())
+
+pseudo_r2 <- 1 - (logit_mod$deviance / logit_null$deviance)
+roc_obj   <- roc(logit_mod$y, logit_mod$fitted.values, quiet = TRUE)
+auc_val   <- as.numeric(auc(roc_obj))
+```
+
+```{r model-diagnostics, echo=FALSE}
+tibble(
+  Metric  = c("Rows in logistic model", "McFadden pseudo-R²", "AUC", "MCAR verdict"),
+  Value   = c(
+    comma(nrow(model_df)),
+    round(pseudo_r2, 4),
+    round(auc_val, 4),
+    ifelse(auc_val < 0.55, "Cannot reject MCAR",
+    ifelse(auc_val < 0.70, "MCAR rejected — moderate MAR",
+                           "MCAR strongly rejected — IPW required"))
+  )
+) %>%
+  kbl(col.names = c("", ""), booktabs = TRUE,
+      caption = "Stage-1 logistic model diagnostics") %>%
+  kable_styling(latex_options = c("striped", "hold_position"), full_width = FALSE)
+```
+
+## 3.1  ROC Curve
+
+```{r fig-roc, echo=FALSE, fig.cap="ROC curve for the missingness prediction model. AUC well above 0.5 confirms MCAR is rejected.", fig.height=4}
+roc_df <- data.frame(fpr = 1 - roc_obj$specificities,
+                     tpr = roc_obj$sensitivities)
+
+ggplot(roc_df, aes(x = fpr, y = tpr)) +
+  geom_line(linewidth = 1.1, colour = "#0077b6") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey60") +
+  annotate("text", x = 0.65, y = 0.2,
+           label = paste0("AUC = ", round(auc_val, 3)),
+           fontface = "bold", size = 5, colour = "#0077b6") +
+  coord_equal() +
+  labs(title = "ROC — Predicting TIQ Observability",
+       x = "False Positive Rate", y = "True Positive Rate") +
+  theme_minimal(base_size = 12)
+```
+
+## 3.2  Coefficient Table
+
+Odds ratios > 1 mean a row with that characteristic is *more* likely to have a
+computable TIQ; < 1 means *less* likely (i.e., systematically underrepresented
+in the observed sample).
+
+```{r coef-table, echo=FALSE}
+coef_tbl <- tidy(logit_mod, exponentiate = TRUE, conf.int = TRUE) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(
+    OR          = round(estimate, 3),
+    `95% CI`    = paste0("[", round(conf.low, 3), ", ", round(conf.high, 3), "]"),
+    `p-value`   = round(p.value, 4),
+    Significant = ifelse(p.value < 0.05, "yes", "")
+  ) %>%
+  select(Predictor = term, OR, `95% CI`, `p-value`, Significant) %>%
+  arrange(`p-value`)
+
+coef_tbl %>%
+  kbl(booktabs = TRUE,
+      caption = "Logistic model coefficients (OR). OR > 1 = more likely to be observed.") %>%
+  kable_styling(latex_options = c("striped", "hold_position", "scale_down"),
+                full_width = FALSE) %>%
+  row_spec(which(coef_tbl$Significant == "yes"), bold = TRUE) %>%
+  row_spec(0, bold = TRUE)
+```
+
+---
+
+# 4  Compute Stabilised IPW Weights
+
+The stabilised weight for row $i$ is:
+
+$$w_i = \frac{\bar{p}_{\text{ISO}(i)}}{p_i}$$
+
+where $\bar{p}_{\text{ISO}(i)}$ is the marginal probability of having a
+computable TIQ **within the same ISO** as project $i$, and $p_i$ is the fitted
+probability from the logistic model. ISO-stratified marginals are used because
+match rates differ dramatically across ISOs (SPP \(\approx\)5\%, MISO
+\(\approx\)28\%, PJM \(\approx\)98\%). A single pooled marginal would
+upweight SPP/MISO relative to PJM purely due to data coverage differences —
+not within-ISO selection bias. Stratifying keeps the weights within each ISO
+and prevents this compositional shift from dominating Stage 2 estimates.
+
+Weights are trimmed at the 99th percentile to prevent extreme values from
+destabilising downstream regressions.
+
+```{r weights}
+# v4: ISO-stratified stabilised weights
+# Numerator is the per-ISO marginal P(has_tiq), not the pooled marginal.
+iso_marginals <- model_df %>%
+  group_by(iso) %>%
+  summarise(p_marginal_iso = mean(has_tiq), .groups = "drop")
+
+weights_df <- model_df %>%
+  left_join(iso_marginals, by = "iso") %>%
+  mutate(
+    p_obs    = logit_mod$fitted.values,
+    ipw_stab = p_marginal_iso / p_obs,
+    ipw_trim = pmin(ipw_stab, quantile(ipw_stab, 0.99))
+  )
+
+p99_threshold <- quantile(weights_df$ipw_stab, 0.99)
+n_extreme     <- sum(weights_df$ipw_stab > 5)
+```
+
+```{r weights-summary, echo=FALSE}
+tibble(
+  Metric = c(
+    "P99 trim threshold",
+    "Mean weight (trimmed)",
+    "Median weight (trimmed)",
+    "Max weight (trimmed)",
+    "Rows with raw weight > 5"
+  ),
+  Value = c(
+    round(p99_threshold, 3),
+    round(mean(weights_df$ipw_trim), 3),
+    round(median(weights_df$ipw_trim), 3),
+    round(max(weights_df$ipw_trim), 3),
+    paste0(n_extreme, " (", round(100 * n_extreme / nrow(weights_df), 1), "%)")
+  )
+) %>%
+  kbl(col.names = c("", ""), booktabs = TRUE,
+      caption = "IPW weight summary (v4: ISO-stratified marginals)") %>%
+  kable_styling(latex_options = c("striped", "hold_position"), full_width = FALSE)
+```
+
+```{r weights-by-iso, echo=FALSE}
+# Show per-ISO marginals so it is clear what the numerator is for each ISO
+iso_marginals %>%
+  arrange(desc(p_marginal_iso)) %>%
+  mutate(p_marginal_iso = scales::percent(p_marginal_iso, accuracy = 0.1)) %>%
+  kbl(col.names = c("ISO", "Marginal P(has TIQ)"), booktabs = TRUE,
+      caption = "Per-ISO marginal match rates used as IPW numerators (v4)") %>%
+  kable_styling(latex_options = c("striped", "hold_position"), full_width = FALSE)
+```
+
+## 4.1  Weight Distribution
+
+```{r fig-weights, echo=FALSE, fig.cap="Distribution of trimmed IPW weights. Rows with high weights are underrepresented in the observed sample and will be upweighted in Stage 2 models.", fig.height=4}
+p_hist <- ggplot(weights_df, aes(x = ipw_trim)) +
+  geom_histogram(bins = 60, fill = "#0077b6", colour = "white", linewidth = 0.2) +
+  geom_vline(xintercept = 1, linetype = "dashed", colour = "grey40") +
+  scale_x_continuous(labels = number_format(accuracy = 0.1)) +
+  labs(title = "Distribution of Trimmed IPW Weights",
+       subtitle = "Dashed line at 1.0 (no reweighting needed). Right tail = underrepresented rows.",
+       x = "ipw_trim", y = "Count") +
+  theme_minimal(base_size = 11)
+
+p_iso <- weights_df %>%
+  group_by(iso) %>%
+  summarise(med_w = median(ipw_trim), .groups = "drop") %>%
+  filter(!is.na(iso)) %>%
+  ggplot(aes(x = reorder(iso, med_w), y = med_w, fill = med_w)) +
+  geom_col(width = 0.7) +
+  geom_hline(yintercept = 1, linetype = "dashed", colour = "grey40") +
+  coord_flip() +
+  scale_fill_gradient(low = "#43AA8B", high = "#e63946", guide = "none") +
+  labs(title = "Median Weight by ISO",
+       subtitle = "ISO > 1 = underrepresented in observed sample",
+       x = NULL, y = "Median ipw_trim") +
+  theme_minimal(base_size = 11)
+
+p_hist | p_iso
+```
+
+```{r fig-weights-tech, echo=FALSE, fig.cap="Median IPW weight by technology. Technologies above 1.0 are underrepresented in the observed sample relative to the full queue population.", fig.height=3.5}
+weights_df %>%
+  group_by(tech) %>%
+  summarise(med_w = median(ipw_trim), n = n(), .groups = "drop") %>%
+  filter(!is.na(tech), n >= 20) %>%
+  ggplot(aes(x = reorder(tech, med_w), y = med_w, fill = med_w)) +
+  geom_col(width = 0.7) +
+  geom_hline(yintercept = 1, linetype = "dashed", colour = "grey40") +
+  coord_flip() +
+  scale_fill_gradient(low = "#43AA8B", high = "#e63946", guide = "none") +
+  labs(title = "Median IPW Weight by Technology",
+       x = NULL, y = "Median ipw_trim") +
+  theme_minimal(base_size = 11)
+```
+
+---
+
+# 5  Save Outputs
+
+```{r save}
+# Columns to write — row_id is the join key for all Stage 2 models
+output_cols <- c(
+  "row_id", "iso", "tech", "mw_num", "log_mw", "queue_yr",
+  "status_group", "has_tiq", "tiq_raw",
+  "p_obs", "ipw_stab", "ipw_trim"
+)
+
+if ("queue_id" %in% names(weights_df)) output_cols <- c("queue_id", output_cols)
+
+weights_out <- weights_df %>% select(any_of(output_cols))
+
+# Create output directory if it doesn't exist yet
+dir.create(dirname(OUT_WEIGHTS), recursive = TRUE, showWarnings = FALSE)
+
+write_csv(weights_out, OUT_WEIGHTS)
+saveRDS(logit_mod, OUT_MODEL)
+```
+
+```{r save-summary, echo=FALSE}
+n_no_weight <- nrow(df) - nrow(weights_df)
+
+tibble(
+  File    = c("ipw_weights.csv", "ipw_model.rds"),
+  Rows    = c(comma(nrow(weights_out)), "—"),
+  Note    = c(
+    paste0(comma(n_no_weight), " input rows excluded (missing predictor) — these cannot be used in IPW-weighted models"),
+    "Saved logistic model object for inspection and reuse"
+  )
+) %>%
+  kbl(booktabs = TRUE, caption = paste0("Files written to ", MODEL_DIR)) %>%
+  kable_styling(latex_options = c("striped", "hold_position", "scale_down"),
+                full_width = FALSE) %>%
+  row_spec(0, bold = TRUE)
+```
+
+---
+
+# 6  How to Use These Weights in Stage 2
+
+Join `ipw_weights.csv` to your Stage 2 data on `row_id` and pass `ipw_trim`
+as the `weights` argument. Three usage patterns:
+
+```{r usage, eval=FALSE}
+library(tidyverse)
+library(survival)
+library(cmprsk)
+
+weights <- read_csv(file.path(
+  Sys.getenv("PLANNING_QUEUES_MODEL_DIR", "../../data"),
+  "ipw_weights.csv"
+))
+
+model_data <- your_data %>%
+  left_join(weights %>% select(row_id, ipw_trim), by = "row_id") %>%
+  filter(!is.na(ipw_trim))
+
+# ── Option A: Weighted OLS (baseline, fast) ───────────────────────────────
+lm(tiq_years ~ policy_lever + iso + tech + log_mw + queue_yr,
+   data    = model_data,
+   weights = ipw_trim)
+
+# ── Option B: Weighted parametric survival (recommended for duration) ─────
+# Includes still-in-queue rows as right-censored observations.
+# event = 1 if came online, 0 if still in queue (censored)
+survreg(Surv(tiq_days, event) ~ policy_lever + iso + tech + log_mw + queue_yr,
+        data    = model_data %>% filter(status_group != "withdrawn"),
+        weights = ipw_trim,
+        dist    = "weibull")
+
+# ── Option C: Competing risks (recommended — separates completion vs
+#             withdrawal; core model for MW-online objective) ──────────────
+# event_code: 1 = came online, 2 = withdrew, 0 = still in queue (censored)
+crr(ftime   = model_data$tiq_days,
+    fstatus = model_data$event_code,
+    cov1    = model_data[, c("policy_lever", "log_mw", "queue_yr",
+                              "iso_num", "tech_num")],
+    weights = model_data$ipw_trim)
+```
+
+---
+
+*Generated: `r Sys.Date()` | Data: `ISO_EIA_Merged_v7.csv` | Stage 1 of PlanningQueues policy model pipeline*

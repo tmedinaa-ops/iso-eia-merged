@@ -1,0 +1,43 @@
+# Data — released separately through an academic data archive.
+# Keep the directory structure, ignore the contents.
+data/*
+!data/.gitkeep
+!data/raw/
+!data/processed/
+data/raw/*
+!data/raw/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.Python
+
+# R
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+*.Rproj
+*_files/
+*_cache/
+*.html
+*.log
+
+# Output artifacts from R Markdown
+*.pdf
+*.png
+*.jpg
+*.jpeg
+
+# macOS / editor noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
