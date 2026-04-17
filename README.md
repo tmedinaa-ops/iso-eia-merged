@@ -80,4 +80,4 @@ Arriaga-Medina, T. (2026). Constructing a Cross-ISO Interconnection Queue Datase
 
 ## License
 
-TBD. Academic use is intended; commercial redistribution of the merged dataset is restricted pending release review.
+The code in this repository is released under the MIT License (see `LICENSE`). The merged dataset itself is distributed separately through an academic data archive and carries its own license terms; commercial redistribution of the dataset is restricted pending release review.
