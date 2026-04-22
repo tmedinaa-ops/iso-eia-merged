@@ -26,6 +26,15 @@ Run `make help` for all targets. `make check` alone runs the preflight script an
 
 See `docs/DATA_ACCESS.md` for how to obtain the merged CSV before release, and `docs/REPRODUCTION.md` for a deeper walkthrough including the raw-data pipeline (which rebuilds v7 itself from LBNL + EIA + ISO sources).
 
+## Dashboard only (skip R)
+
+The county explorer is a standalone Python build that reads `data/ISO_EIA_Merged_v7.csv` directly. It does not depend on the R analyses. If you only want the interactive dashboard, skip the R toolchain entirely:
+
+    make install-python    # pandas, addfips, etc. — no R needed
+    make dashboard         # produces build/interconnection_county_explorer.html
+
+First run needs internet so `build_dashboard.py` can download and cache a ~3 MB county GeoJSON. Subsequent builds are offline.
+
 ## Repository layout
 
     .

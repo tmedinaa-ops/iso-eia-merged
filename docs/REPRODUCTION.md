@@ -100,10 +100,81 @@ Example, running against a dataset on an external drive without touching the rep
 
 These are real limitations worth flagging to anyone trying to reproduce the paper exactly:
 
-1. **Python dependency versions are lower-bounded, not pinned.** `requirements.txt` uses `>=` constraints. For bit-exact reproduction, pin to the exact versions used in the paper (add a `requirements.lock` via `pip-compile` before publishing).
+1. **Descriptive Rmds still read v5 and a pipeline intermediate, not v7.**
+   Three of the seven Rmds — `queue_completion_times.Rmd`,
+   `queue_time_analysis.Rmd`, `queue_time_by_technology.Rmd` — point at
+   `ISO_EIA_Merged_v5.csv` and `TIQ_Analysis_Clean.csv` (a 9,256-row
+   filtered extract from an earlier vintage). The Stage 0-2 policy
+   pipeline (missingness, IPW construction, IPW validation, policy
+   model) correctly reads v7. All four analysis CSVs (v5, v7,
+   `TIQ_Analysis_Clean.csv`, `EIA_860_All_Generators.csv`) are checked
+   into `data/` so `make all` works today, but the descriptive analyses
+   are running against a 65,203-row v5 snapshot while the policy model
+   runs against the 65,717-row v7.
 
-2. **R packages aren't locked.** The installer pulls current CRAN versions. For archival reproduction, initialize `renv` at the repo root (`renv::init()`) and commit the resulting `renv.lock`. This is on the TODO list but not yet done.
+   **Target end state:** repo ships v7 and `EIA_860_All_Generators.csv`
+   only; v5 and `TIQ_Analysis_Clean.csv` get deleted. v5 is a strict
+   subset of v7 (same schema, 514 fewer ISO-NE rows — the rows that
+   `iso_ne_fix.py` inserts). `TIQ_Analysis_Clean.csv` is a pipeline
+   intermediate that can be regenerated from v7 inline with a filter
+   block. `EIA_860_All_Generators.csv` stays because it is the
+   independent ground-truth universe used by section 8 of
+   `queue_completion_times.Rmd` as the denominator for the
+   capture-rate chart — v7 contains EIA metadata only for matched
+   rows, so it cannot reconstruct that denominator.
 
-3. **Raw-data pipeline isn't automated end-to-end.** The raw LBNL/EIA/ISO files aren't redistributable yet, so the `make all` path starts from the merged CSV rather than rebuilding it. Once the archive release is live, this guide will be updated with a `make pipeline` target that downloads the raw files and rebuilds `ISO_EIA_Merged_v7.csv` from scratch.
+   **Migration steps:**
 
-4. **Right-censoring of active projects.** The policy model's completion hazard estimate is subject to right-censoring bias; see `CLAUDE.md` in the Obsidian vault and the paper for the AFT sensitivity analysis.
+   *Step 1 — queue_completion_times.Rmd.* Change the filename on line 34
+   from `ISO_EIA_Merged_v5.csv` to `ISO_EIA_Merged_v7.csv`. Update the
+   caption on line 152 and the footer on line 675 to match. Expect row
+   counts to shift by ~514 rows. No other code changes; the two files
+   share a schema. Section 8 already reads `EIA_860_All_Generators.csv`;
+   leave it alone.
+
+   *Step 2 — queue_time_analysis.Rmd and queue_time_by_technology.Rmd.*
+   Replace the `read_csv(... "TIQ_Analysis_Clean.csv" ...)` block with a
+   v7 read that applies the TIQ filter inline:
+   ```r
+   df_raw <- read_csv(file.path(DATA_DIR, "ISO_EIA_Merged_v7.csv"),
+                      show_col_types = FALSE) %>%
+     filter(status_group %in% c("completed", "withdrawn"),
+            !is.na(time_in_queue), time_in_queue > 0) %>%
+     mutate(outcome           = if_else(status_group == "completed",
+                                        "came_online", "withdrew"),
+            queue_entry_year  = year(as.Date(queue_date)),
+            mw1               = mw,
+            region            = lbnl_region,
+            time_in_queue_days = time_in_queue) %>%
+     filter(queue_entry_year >= 2000, queue_entry_year <= 2019)
+   ```
+   Before committing, confirm that v7's `time_in_queue` is already in
+   days (TIQ uses `time_in_queue_days`). If it is not, adjust the
+   rename. The existing downstream `mutate` blocks rely on `mw1`,
+   `region`, `type1`, `outcome`, `queue_entry_year`, and
+   `time_in_queue_days`, so the shim above covers them.
+
+   *Step 3 — verification.* Before deleting anything, render all seven
+   Rmds against v7 and diff the rendered HTML, plus the IPW weights
+   CSV, against the current v5/TIQ outputs. Expect descriptive numbers
+   to move slightly because of the 514 added ISO-NE rows. Flag any
+   headline number that moves by more than ~2% and update the paper
+   text before shipping.
+
+   *Step 4 — cleanup.* Once the diff is reviewed:
+   `git rm data/ISO_EIA_Merged_v5.csv data/TIQ_Analysis_Clean.csv`,
+   remove the corresponding `!data/...` whitelist entries from
+   `.gitignore`, drop this gap entry, and update `DATA_ACCESS.md` so it
+   lists only v7 and `EIA_860_All_Generators.csv` as the required
+   inputs.
+
+   Estimate: 2-4 hours if descriptive numbers move only at the noise
+   level; longer if any headline needs a paper edit.
+
+2. **Python dependency versions are lower-bounded, not pinned.** `requirements.txt` uses `>=` constraints. For bit-exact reproduction, pin to the exact versions used in the paper (add a `requirements.lock` via `pip-compile` before publishing).
+
+3. **R packages aren't locked.** The installer pulls current CRAN versions. For archival reproduction, initialize `renv` at the repo root (`renv::init()`) and commit the resulting `renv.lock`. This is on the TODO list but not yet done.
+
+4. **Raw-data pipeline isn't automated end-to-end.** The raw LBNL/EIA/ISO files aren't redistributable yet, so the `make all` path starts from the merged CSV rather than rebuilding it. Once the archive release is live, this guide will be updated with a `make pipeline` target that downloads the raw files and rebuilds `ISO_EIA_Merged_v7.csv` from scratch.
+
+5. **Right-censoring of active projects.** The policy model's completion hazard estimate is subject to right-censoring bias; see `CLAUDE.md` in the Obsidian vault and the paper for the AFT sensitivity analysis.

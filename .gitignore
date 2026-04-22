@@ -1,9 +1,17 @@
-# Data — released separately through an academic data archive.
-# Keep the directory structure, ignore the contents.
+# Data
+# The merged dataset will eventually be released through an academic data
+# archive (Zenodo / ICPSR). Until then, the four files needed for `make all`
+# are whitelisted below so clones can reproduce the analysis and dashboard
+# end-to-end without a separate download step. Everything else in data/
+# (raw LBNL / EIA / ISO workbooks, pipeline intermediates) stays ignored.
 data/*
 !data/.gitkeep
 !data/raw/
 !data/processed/
+!data/ISO_EIA_Merged_v5.csv
+!data/ISO_EIA_Merged_v7.csv
+!data/EIA_860_All_Generators.csv
+!data/TIQ_Analysis_Clean.csv
 data/raw/*
 !data/raw/.gitkeep
 data/processed/*
