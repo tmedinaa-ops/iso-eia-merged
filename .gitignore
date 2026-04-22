@@ -9,6 +9,9 @@ data/raw/*
 data/processed/*
 !data/processed/.gitkeep
 
+# Build artifacts (dashboard HTML, rendered analysis, cached GeoJSON)
+build/
+
 # Python
 __pycache__/
 *.py[cod]
@@ -28,6 +31,9 @@ env/
 *_cache/
 *.html
 *.log
+
+# Keep the dashboard HTML template (it is source, not a build artifact)
+!src/python/dashboard/dashboard_template.html
 
 # Output artifacts from R Markdown
 *.pdf

@@ -2,18 +2,45 @@
 
 Pipeline and analysis code for the ISO_EIA_Merged_v7 interconnection queue dataset, a cross-ISO merge of U.S. interconnection queue records, LBNL Queued Up, and EIA Form 860.
 
-The accompanying data descriptor paper (Arriaga-Medina, 2026) documents the construction methodology, the variable schema, and known limitations. This repository holds the pipeline code that produces the dataset and the downstream R analysis code that consumes it.
+The accompanying data descriptor paper (Arriaga-Medina, 2026) documents the construction methodology, the variable schema, and known limitations. This repository holds the pipeline code that produces the dataset, the downstream R analysis code that consumes it, and an interactive county-level dashboard.
+
+## Reproduce in three steps
+
+The repo is set up so that once you have `data/ISO_EIA_Merged_v7.csv` in place, a single `make all` command reproduces every HTML output — the seven R Markdown analyses and the county explorer — into `build/`.
+
+    # 1. place the merged dataset
+    cp /path/to/ISO_EIA_Merged_v7.csv data/
+
+    # 2. install Python and R dependencies (one-time)
+    make install
+
+    # 3. run everything
+    make all
+
+Outputs:
+
+- `build/analysis/*.html` — rendered R Markdown analyses (descriptive, missingness, IPW, policy model).
+- `build/interconnection_county_explorer.html` — the interactive county-level dashboard, ~30 MB self-contained HTML.
+
+Run `make help` for all targets. `make check` alone runs the preflight script and reports whether your environment is ready without producing outputs.
+
+See `docs/DATA_ACCESS.md` for how to obtain the merged CSV before release, and `docs/REPRODUCTION.md` for a deeper walkthrough including the raw-data pipeline (which rebuilds v7 itself from LBNL + EIA + ISO sources).
 
 ## Repository layout
 
     .
     ├── src/
     │   ├── python/          Data-construction pipeline (6 modules)
+    │   │   └── dashboard/   County-level interactive dashboard generator
     │   └── r/               Downstream survival and policy analysis (7 R Markdown)
-    ├── data/                Working directory for raw inputs and pipeline outputs
-    │   ├── raw/             Optional subfolder (gitignored)
-    │   └── processed/       Optional subfolder (gitignored)
-    ├── docs/                Data descriptor and supplementary documentation
+    ├── scripts/             Install and runner scripts used by the Makefile
+    ├── data/                Working directory for raw inputs and pipeline outputs (gitignored)
+    │   ├── raw/
+    │   └── processed/
+    ├── build/               Generated artifacts (gitignored)
+    │   └── analysis/        Rendered Rmds from `make analysis`
+    ├── docs/                Data access and reproduction notes
+    ├── Makefile             One-command reproduction targets
     ├── requirements.txt     Python dependencies
     └── .gitignore
 
@@ -34,12 +61,13 @@ R Markdown files use the equivalent pattern:
     )
     MODEL_DIR <- Sys.getenv("PLANNING_QUEUES_MODEL_DIR", "../../data")
 
-If `PLANNING_QUEUES_DATA` is unset, Python scripts read and write under `repo/data/`. If the two R env vars are unset, the R Markdown files read `../../data/ISO_EIA_Merged_v7.csv` (resolved from `src/r/`) and write IPW artifacts to the same folder.
+If `PLANNING_QUEUES_DATA` is unset, Python scripts read and write under `repo/data/`. If the two R env vars are unset, the R Markdown files read `../../data/ISO_EIA_Merged_v7.csv` (resolved from `src/r/`) and write IPW artifacts to the same folder. The dashboard build script adds `PLANNING_QUEUES_BUILD` (defaults to `<repo>/build`) for its output.
 
-To point the pipeline at a different location, export the variables before running. For example:
+To point the pipeline at a different location, export the variables before running:
 
     export PLANNING_QUEUES_DATA=/path/to/your/data
-    python3 src/python/apply_all_iso_matches.py
+    export PLANNING_QUEUES_BUILD=/path/to/build
+    make all
 
 ## Data placement
 
@@ -58,21 +86,27 @@ Modules in execution order, from `src/python/`:
 5. `iso_ne_fix.py` — resolves the v5 ISO-NE queue_id collision; inserts absent LBNL ISO-NE rows without modifying existing v5 records.
 6. `apply_all_iso_matches.py` — orchestrator; runs the full pipeline and emits the final merged CSV.
 
-Dependencies: pandas (≥2.0), rapidfuzz (≥3.0), openpyxl (≥3.1), scipy (≥1.11), numpy (≥1.24). See `requirements.txt` for pinned versions.
+Dependencies: pandas (≥2.0), rapidfuzz (≥3.0), openpyxl (≥3.1), scipy (≥1.11), numpy (≥1.24), addfips (≥0.4 for the dashboard). See `requirements.txt`.
 
 ## Analysis (R)
 
-Files in `src/r/`:
+Files in `src/r/`, in the order `scripts/render_analysis.R` runs them:
 
-- `queue_time_analysis.Rmd` — trend decomposition of queue durations.
-- `queue_completion_times.Rmd` — cohort survival curves for completed projects.
-- `queue_time_by_technology.Rmd` — stratified analysis by fuel category.
-- `missingness_mechanism_analysis.Rmd` — diagnoses the missingness mechanism for IPW eligibility.
-- `compute_ipw_weights.Rmd` — constructs inverse probability weights for the policy model.
-- `ipw_weight_validation.Rmd` — diagnostic checks on the computed weights (positivity, balance, variance).
-- `policy_model.Rmd` — Fine-Gray competing-risks model of completion versus withdrawal.
+1. `queue_time_analysis.Rmd` — trend decomposition of queue durations.
+2. `queue_completion_times.Rmd` — cohort survival curves for completed projects.
+3. `queue_time_by_technology.Rmd` — stratified analysis by fuel category.
+4. `missingness_mechanism_analysis.Rmd` — diagnoses the missingness mechanism for IPW eligibility.
+5. `compute_ipw_weights.Rmd` — constructs inverse probability weights for the policy model.
+6. `ipw_weight_validation.Rmd` — diagnostic checks on the computed weights (positivity, balance, variance).
+7. `policy_model.Rmd` — Fine-Gray competing-risks model of completion versus withdrawal.
 
-R package dependencies: tidyverse, survival, survminer, cmprsk, quantreg, Kendall, scales, patchwork, ggridges, kableExtra, viridis.
+R package dependencies: tidyverse, survival, survminer, cmprsk, quantreg, Kendall, scales, patchwork, ggridges, kableExtra, viridis, rmarkdown, knitr. Install with `make install-r` or `Rscript scripts/install_r_packages.R`.
+
+## Dashboard
+
+`src/python/dashboard/build_dashboard.py` reads the merged v7 CSV, attaches a 5-digit county FIPS code to each row (~93% match rate), aggregates by county, and writes a single self-contained HTML file with a clickable choropleth, search, and CSV export. Output lands in `build/interconnection_county_explorer.html`.
+
+Build with `make dashboard`. See `src/python/dashboard/README.md` for details.
 
 ## Citation
 

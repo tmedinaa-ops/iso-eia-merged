@@ -1,0 +1,719 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Interconnection Queue - County Explorer</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,400;0,500;0,600;1,400&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+<style>
+  :root {
+    --bg: #faf8f4;
+    --surface: #ffffff;
+    --ink: #1c1b19;
+    --ink-soft: #5a564f;
+    --ink-muted: #8a867e;
+    --rule: #ece7dd;
+    --rule-soft: #f3efe7;
+    --accent: #2a4d43;
+    --accent-hover: #1e3a32;
+    --accent-soft: #e8ede9;
+    --danger-soft: #f4eae1;
+    --radius-lg: 14px;
+    --radius-md: 10px;
+    --radius-sm: 7px;
+    --shadow-sm: 0 1px 2px rgba(28, 27, 25, 0.04), 0 1px 3px rgba(28, 27, 25, 0.03);
+    --shadow-md: 0 4px 14px rgba(28, 27, 25, 0.06), 0 1px 3px rgba(28, 27, 25, 0.04);
+    --transition: 160ms cubic-bezier(0.22, 0.61, 0.36, 1);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: "Geist", -apple-system, BlinkMacSystemFont, sans-serif;
+    font-feature-settings: "ss01", "cv11";
+    background: var(--bg);
+    color: var(--ink);
+    font-size: 14px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+  .shell { max-width: 1440px; margin: 0 auto; padding: 28px 32px 40px; }
+  header { display: flex; align-items: baseline; justify-content: space-between; gap: 32px; margin-bottom: 20px; }
+  header .title-wrap { max-width: 680px; }
+  header h1 {
+    font-family: "Playfair Display", "Times New Roman", serif;
+    font-style: normal;
+    font-weight: 500;
+    font-size: 36px;
+    line-height: 1.08;
+    letter-spacing: -0.012em;
+    margin: 0 0 6px 0;
+    color: var(--ink);
+  }
+  header .sub { font-size: 13.5px; color: var(--ink-soft); max-width: 64ch; }
+
+  .metric-bar {
+    display: flex; align-items: center; gap: 14px;
+    padding: 12px 16px;
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow-sm);
+    margin-bottom: 16px;
+    flex-wrap: wrap;
+  }
+  .metric-bar label { font-size: 12.5px; color: var(--ink-soft); display: flex; align-items: center; gap: 8px; }
+  .coverage { font-size: 12px; color: var(--ink-muted); margin-left: auto; font-variant-numeric: tabular-nums; }
+  .metric-bar .divider {
+    width: 1px; height: 20px; background: var(--rule);
+  }
+
+  .search {
+    position: relative;
+    display: flex; align-items: center;
+  }
+  .search svg { position: absolute; left: 11px; pointer-events: none; color: var(--ink-muted); }
+  .search input[type=text] {
+    width: 280px;
+    padding-left: 34px;
+  }
+  .search-results {
+    position: absolute;
+    top: calc(100% + 6px); left: 0;
+    width: 340px;
+    max-height: 320px;
+    overflow-y: auto;
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow-md);
+    z-index: 50;
+    display: none;
+    padding: 4px;
+  }
+  .search-results.open { display: block; }
+  .search-results .item {
+    display: flex; align-items: baseline; justify-content: space-between; gap: 12px;
+    padding: 8px 12px;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: background 120ms ease;
+    font-size: 13px;
+  }
+  .search-results .item:hover, .search-results .item.active { background: var(--accent-soft); }
+  .search-results .item .name { color: var(--ink); font-weight: 500; }
+  .search-results .item .state { font-family: "Geist Mono", monospace; color: var(--ink-muted); font-size: 11px; letter-spacing: 0.04em; }
+  .search-results .item .meta {
+    font-size: 11px; color: var(--ink-muted); font-variant-numeric: tabular-nums;
+    font-family: "Geist Mono", monospace;
+  }
+  .search-results .empty-msg { padding: 14px; font-size: 12.5px; color: var(--ink-muted); text-align: center; }
+
+  select, input[type=text], button {
+    font-family: inherit;
+    font-size: 13px;
+    color: var(--ink);
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: var(--radius-sm);
+    padding: 7px 11px;
+    transition: border-color var(--transition), box-shadow var(--transition), background var(--transition), color var(--transition);
+  }
+  select { padding-right: 28px; cursor: pointer; appearance: none; background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 10 10' fill='none'><path d='M2 4l3 3 3-3' stroke='%235a564f' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/></svg>"); background-repeat: no-repeat; background-position: right 10px center; }
+  select:hover, input[type=text]:hover { border-color: #d8d3c7; }
+  select:focus, input[type=text]:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+
+  button { cursor: pointer; font-weight: 500; display: inline-flex; align-items: center; gap: 7px; }
+  button:hover { border-color: #d8d3c7; background: #fbfaf6; }
+  button:active { transform: translateY(0.5px); }
+  button.primary {
+    background: var(--accent); color: #fbfaf6; border-color: var(--accent);
+  }
+  button.primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
+  button.primary:disabled { background: #c9c6bf; border-color: #c9c6bf; color: #fbfaf6; cursor: not-allowed; }
+
+  #map {
+    width: 100%; height: 64vh; min-height: 440px;
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-sm);
+    overflow: hidden;
+  }
+
+  #detail {
+    margin-top: 20px;
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-sm);
+    padding: 22px 24px;
+  }
+  .detail-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; margin-bottom: 14px; }
+  .detail-head-text { flex: 1; min-width: 0; }
+  #detailTitle {
+    font-family: "Playfair Display", "Times New Roman", serif;
+    font-style: normal;
+    font-weight: 500;
+    font-size: 26px;
+    line-height: 1.18;
+    letter-spacing: -0.008em;
+    margin: 0 0 4px 0;
+    color: var(--ink);
+  }
+  #detailMeta {
+    font-size: 12.5px;
+    color: var(--ink-soft);
+    font-variant-numeric: tabular-nums;
+    display: flex; flex-wrap: wrap; gap: 6px 14px;
+  }
+  #detailMeta .pill {
+    display: inline-flex; align-items: center; gap: 6px;
+  }
+  #detailMeta .pill .k { color: var(--ink-muted); }
+  #detailMeta .pill .v { color: var(--ink); font-weight: 500; }
+
+  .controls { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 12px; }
+  .controls input[type=text] { width: 240px; }
+  .row-count { font-size: 12px; color: var(--ink-muted); margin-left: auto; font-variant-numeric: tabular-nums; }
+
+  #colTogglePanel {
+    max-height: 180px; overflow: auto;
+    border: 1px solid var(--rule);
+    padding: 12px 14px;
+    border-radius: var(--radius-md);
+    background: var(--rule-soft);
+    display: none;
+    margin-bottom: 12px;
+  }
+  #colTogglePanel label {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 11.5px;
+    font-family: "Geist Mono", monospace;
+    color: var(--ink-soft);
+    margin: 3px 12px 3px 0;
+    cursor: pointer;
+    user-select: none;
+  }
+  #colTogglePanel input[type=checkbox] { accent-color: var(--accent); }
+
+  .table-wrap {
+    overflow: auto;
+    max-height: 420px;
+    border: 1px solid var(--rule);
+    border-radius: var(--radius-md);
+    background: var(--surface);
+  }
+  table {
+    border-collapse: separate;
+    border-spacing: 0;
+    font-size: 12.5px;
+    width: max-content;
+    min-width: 100%;
+    font-variant-numeric: tabular-nums;
+  }
+  th, td {
+    padding: 9px 14px;
+    border-bottom: 1px solid var(--rule-soft);
+    white-space: nowrap;
+    text-align: left;
+    color: var(--ink);
+  }
+  th {
+    background: #fbfaf6;
+    position: sticky; top: 0; z-index: 1;
+    font-weight: 500;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--ink-muted);
+    font-family: "Geist Mono", monospace;
+    border-bottom: 1px solid var(--rule);
+  }
+  tbody tr { transition: background var(--transition); }
+  tbody tr:hover { background: #fbfaf6; }
+  tbody tr:last-child td { border-bottom: none; }
+  td:first-child, th:first-child { padding-left: 18px; }
+
+  .empty-state {
+    padding: 56px 24px;
+    text-align: center;
+    color: var(--ink-muted);
+    font-size: 13px;
+  }
+  .empty-state .mark {
+    display: inline-block;
+    width: 32px; height: 2px;
+    background: var(--rule);
+    margin-bottom: 14px;
+  }
+
+  /* Subtle page-load animation */
+  @keyframes rise { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+  header, .metric-bar, #map, #detail { animation: rise 420ms cubic-bezier(0.22, 0.61, 0.36, 1) both; }
+  .metric-bar { animation-delay: 60ms; }
+  #map { animation-delay: 120ms; }
+  #detail { animation-delay: 180ms; }
+</style>
+</head>
+<body>
+<div class="shell">
+  <header>
+    <div class="title-wrap">
+      <h1>Interconnection Queue, by county.</h1>
+      <div class="sub">Click a county to inspect every project from <code style="font-family:'Geist Mono',monospace;font-size:12.5px;color:var(--ink-soft);">ISO_EIA_Merged_v7</code>. Counties with projects but no value for the selected metric are shown in a soft grey.</div>
+    </div>
+  </header>
+
+  <div class="metric-bar">
+    <div class="search">
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true"><circle cx="7" cy="7" r="4.5" stroke="currentColor" stroke-width="1.5"/><path d="M13.5 13.5l-3-3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+      <input type="text" id="searchInput" placeholder="Search county, state..." autocomplete="off" spellcheck="false">
+      <div class="search-results" id="searchResults" role="listbox"></div>
+    </div>
+    <div class="divider"></div>
+    <label>Color by
+      <select id="metricSel">
+        <option value="n_rows">Project count</option>
+        <option value="avg_time_in_queue">Avg time in queue</option>
+        <option value="total_mw">Total MW</option>
+      </select>
+    </label>
+    <span class="coverage" id="coverageNote"></span>
+  </div>
+
+  <div id="map"></div>
+
+  <div id="detail">
+    <div class="detail-head">
+      <div class="detail-head-text">
+        <h2 id="detailTitle">Click a county on the map</h2>
+        <div id="detailMeta"></div>
+      </div>
+      <button class="primary" id="downloadBtn" disabled>
+        <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M8 2v8m0 0l-3-3m3 3l3-3M3 13h10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <span id="downloadLabel">Download CSV</span>
+      </button>
+    </div>
+    <div class="controls">
+      <button id="colToggleBtn">Columns</button>
+      <input type="text" id="filter" placeholder="Filter rows...">
+      <button id="resetBtn">Reset</button>
+      <span class="row-count" id="rowCount"></span>
+    </div>
+    <div id="colTogglePanel"></div>
+    <div class="table-wrap"><table id="tbl"><thead></thead><tbody></tbody></table></div>
+  </div>
+</div>
+
+<script>
+const AGG = __AGG__;
+const ROWS = __ROWS__;
+const COLS = __COLS__;
+const LABELS = __LABELS__;
+const GEO = __GEO__;
+
+const fipsList = Object.keys(AGG);
+const customData = fipsList.map(f => {
+  const a = AGG[f];
+  return [a.county, a.state, a.isos, a.n_rows, a.total_mw, a.avg_time_in_queue];
+});
+
+const METRIC_META = {
+  n_rows: { label: "Projects", fmt: v => v == null ? "-" : v.toLocaleString() },
+  avg_time_in_queue: { label: "Days in queue", fmt: v => v == null ? "-" : Math.round(v).toLocaleString() },
+  total_mw: { label: "Total MW", fmt: v => v == null ? "-" : v.toLocaleString(undefined, {maximumFractionDigits:1}) }
+};
+
+const COLORSCALE = [
+  [0.0,  "#eef2ee"],
+  [0.2,  "#c7d3cc"],
+  [0.4,  "#97afa4"],
+  [0.6,  "#628779"],
+  [0.8,  "#3f6557"],
+  [1.0,  "#2a4d43"]
+];
+
+function percentile(arr, p) {
+  const sorted = arr.slice().sort((a,b) => a-b);
+  const i = Math.max(0, Math.min(sorted.length-1, Math.floor(p * (sorted.length-1))));
+  return sorted[i];
+}
+
+function buildTraces(metric) {
+  const vals = fipsList.map(f => AGG[f][metric]);
+  const hasVal = fipsList.filter((f,i) => vals[i] != null);
+  const noVal = fipsList.filter((f,i) => vals[i] == null);
+  const zVals = hasVal.map(f => AGG[f][metric]);
+
+  const zmax = zVals.length ? percentile(zVals.filter(v => v > 0), 0.95) : 1;
+  const zmin = 0;
+
+  const greyTrace = {
+    type: "choropleth",
+    geojson: GEO,
+    locations: noVal,
+    z: noVal.map(_ => 1),
+    featureidkey: "id",
+    colorscale: [[0, "#e8e4da"], [1, "#e8e4da"]],
+    showscale: false,
+    marker: { line: { width: 0.35, color: "#b8b3a5" } },
+    customdata: noVal.map(f => { const a = AGG[f]; return [a.county, a.state, a.isos, a.n_rows, a.total_mw, a.avg_time_in_queue]; }),
+    hovertemplate:
+      "<b>%{customdata[0]}, %{customdata[1]}</b><br>" +
+      "ISO: %{customdata[2]}<br>" +
+      "Projects: %{customdata[3]}<br>" +
+      "Total MW: %{customdata[4]:,.1f}<br>" +
+      "<i>(no value for selected metric)</i><extra></extra>",
+    name: "no data"
+  };
+
+  const colorTrace = {
+    type: "choropleth",
+    geojson: GEO,
+    locations: hasVal,
+    z: zVals,
+    featureidkey: "id",
+    colorscale: COLORSCALE,
+    zmin: zmin,
+    zmax: zmax,
+    reversescale: false,
+    marker: { line: { width: 0.35, color: "#b8b3a5" } },
+    colorbar: {
+      title: { text: METRIC_META[metric].label, font: { family: "Geist Mono, monospace", size: 11, color: "#5a564f" }, side: "top" },
+      len: 0.55,
+      thickness: 10,
+      outlinewidth: 0,
+      tickfont: { family: "Geist Mono, monospace", size: 10, color: "#5a564f" },
+      x: 0.98,
+      xpad: 0,
+      y: 0.5
+    },
+    customdata: hasVal.map(f => { const a = AGG[f]; return [a.county, a.state, a.isos, a.n_rows, a.total_mw, a.avg_time_in_queue]; }),
+    hovertemplate:
+      "<b>%{customdata[0]}, %{customdata[1]}</b><br>" +
+      "ISO: %{customdata[2]}<br>" +
+      "Projects: %{customdata[3]}<br>" +
+      "Total MW: %{customdata[4]:,.1f}<br>" +
+      "Avg time in queue: %{customdata[5]}<extra></extra>",
+    name: METRIC_META[metric].label
+  };
+
+  return { traces: [greyTrace, colorTrace], hasVal: hasVal.length, noVal: noVal.length };
+}
+
+const layout = {
+  geo: {
+    scope: "usa",
+    showlakes: true,
+    lakecolor: "#eaf1ed",
+    bgcolor: "rgba(0,0,0,0)",
+    showland: true,
+    landcolor: "#faf8f4",
+    showsubunits: true,
+    subunitcolor: "#d3cec1",
+    subunitwidth: 0.8
+  },
+  paper_bgcolor: "rgba(0,0,0,0)",
+  plot_bgcolor: "rgba(0,0,0,0)",
+  margin: { l: 0, r: 0, t: 8, b: 0 },
+  font: { family: "Geist, sans-serif", size: 12, color: "#1c1b19" },
+  hoverlabel: { bgcolor: "#1c1b19", bordercolor: "#1c1b19", font: { family: "Geist, sans-serif", color: "#faf8f4", size: 12 } },
+  showlegend: false
+};
+
+let currentMetric = "n_rows";
+let highlightFips = null;
+
+function buildHighlightTrace() {
+  if (!highlightFips) return null;
+  return {
+    type: "choropleth",
+    geojson: GEO,
+    locations: [highlightFips],
+    z: [1],
+    featureidkey: "id",
+    colorscale: [[0, "rgba(232, 180, 120, 0.0)"], [1, "rgba(232, 180, 120, 0.0)"]],
+    showscale: false,
+    marker: { line: { width: 2.2, color: "#c2410c" } },
+    hoverinfo: "skip",
+    name: "selected"
+  };
+}
+
+function renderMap(metric) {
+  currentMetric = metric;
+  const { traces, hasVal, noVal } = buildTraces(metric);
+  const hl = buildHighlightTrace();
+  if (hl) traces.push(hl);
+  Plotly.react("map", traces, layout, { responsive: true, displayModeBar: false });
+  document.getElementById("coverageNote").textContent =
+    hasVal.toLocaleString() + " counties colored  \u00b7  " + noVal.toLocaleString() + " grey (no value)";
+  attachClickHandler();
+}
+renderMap("n_rows");
+document.getElementById("metricSel").addEventListener("change", e => renderMap(e.target.value));
+
+let currentFips = null;
+let currentRows = [];
+let visibleCols = new Set(COLS);
+
+const titleEl = document.getElementById("detailTitle");
+const metaEl = document.getElementById("detailMeta");
+const thead = document.querySelector("#tbl thead");
+const tbody = document.querySelector("#tbl tbody");
+const filterEl = document.getElementById("filter");
+const rowCountEl = document.getElementById("rowCount");
+const colPanel = document.getElementById("colTogglePanel");
+const downloadBtn = document.getElementById("downloadBtn");
+const downloadLabel = document.getElementById("downloadLabel");
+
+function toCSV(cols, rows) {
+  const esc = v => {
+    if (v == null) return "";
+    const s = String(v);
+    if (/[",\n\r]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
+    return s;
+  };
+  const out = [cols.map(esc).join(",")];
+  for (const r of rows) out.push(r.map(esc).join(","));
+  return out.join("\n");
+}
+function slug(s) {
+  return String(s || "").toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "") || "county";
+}
+function downloadCurrent() {
+  if (!currentFips || currentRows.length === 0) return;
+  const a = AGG[currentFips];
+  const csv = toCSV(COLS, currentRows);
+  const blob = new Blob(["\ufeff" + csv], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = "queue_" + slug(a && a.county) + "_" + (a && a.state || "us") + "_" + currentFips + ".csv";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 500);
+}
+downloadBtn.addEventListener("click", downloadCurrent);
+
+function buildColPanel() {
+  colPanel.innerHTML = "";
+  COLS.forEach(c => {
+    const id = "ct_" + c;
+    const lbl = document.createElement("label");
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.id = id;
+    cb.checked = visibleCols.has(c);
+    cb.addEventListener("change", () => {
+      if (cb.checked) visibleCols.add(c); else visibleCols.delete(c);
+      render();
+    });
+    lbl.appendChild(cb);
+    lbl.appendChild(document.createTextNode(" " + c));
+    colPanel.appendChild(lbl);
+  });
+}
+buildColPanel();
+document.getElementById("colToggleBtn").addEventListener("click", () => {
+  colPanel.style.display = colPanel.style.display === "block" ? "none" : "block";
+});
+document.getElementById("resetBtn").addEventListener("click", () => {
+  filterEl.value = "";
+  visibleCols = new Set(COLS);
+  buildColPanel();
+  render();
+});
+filterEl.addEventListener("input", render);
+
+function render() {
+  const cols = COLS.filter(c => visibleCols.has(c));
+  thead.innerHTML = "<tr>" + cols.map(c => "<th>" + escapeHtml(c) + "</th>").join("") + "</tr>";
+  const q = filterEl.value.trim().toLowerCase();
+  let rows = currentRows;
+  if (q) {
+    rows = rows.filter(r => r.some(v => v != null && String(v).toLowerCase().includes(q)));
+  }
+  const colIdx = cols.map(c => COLS.indexOf(c));
+  const MAX = 2000;
+  const shown = rows.slice(0, MAX);
+  tbody.innerHTML = shown.map(r =>
+    "<tr>" + colIdx.map(i => "<td>" + escapeHtml(r[i] == null ? "" : r[i]) + "</td>").join("") + "</tr>"
+  ).join("");
+  let msg = rows.length + " rows";
+  if (rows.length > MAX) msg += " (showing first " + MAX + ")";
+  rowCountEl.textContent = msg;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
+}
+
+function pill(k, v) {
+  return '<span class="pill"><span class="k">' + escapeHtml(k) + '</span><span class="v">' + escapeHtml(v) + '</span></span>';
+}
+
+function selectCounty(fips, opts) {
+  opts = opts || {};
+  currentFips = fips;
+  currentRows = ROWS[fips] || [];
+  const a = AGG[fips];
+  const label = a ? (a.county + ", " + a.state) : (LABELS[fips] || fips);
+  titleEl.textContent = label + ".";
+  if (a) {
+    const parts = [
+      pill("Projects", Number(a.n_rows).toLocaleString()),
+      pill("Total MW", a.total_mw == null ? "\u2014" : Number(a.total_mw).toLocaleString(undefined, {maximumFractionDigits: 1})),
+      pill("Avg days in queue", a.avg_time_in_queue == null ? "\u2014" : Math.round(a.avg_time_in_queue).toLocaleString()),
+      pill("ISO", a.isos || "\u2014"),
+      pill("FIPS", fips)
+    ];
+    metaEl.innerHTML = parts.join("");
+  } else {
+    metaEl.textContent = "No aggregate stats available";
+  }
+  downloadBtn.disabled = currentRows.length === 0;
+  downloadLabel.textContent = currentRows.length === 0
+    ? "Download CSV"
+    : "Download " + currentRows.length.toLocaleString() + " rows";
+  filterEl.value = "";
+  render();
+
+  if (opts.highlight) {
+    highlightFips = fips;
+    renderMap(currentMetric);
+    document.getElementById("detail").scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+}
+
+function attachClickHandler() {
+  const mapEl = document.getElementById("map");
+  mapEl.removeAllListeners && mapEl.removeAllListeners("plotly_click");
+  mapEl.on("plotly_click", ev => {
+    if (!ev.points || ev.points.length === 0) return;
+    const fips = ev.points[0].location;
+    highlightFips = fips;
+    selectCounty(fips, { highlight: false });
+    renderMap(currentMetric);
+  });
+}
+
+const SEARCH_INDEX = Object.keys(AGG).map(fips => {
+  const a = AGG[fips];
+  const county = (a.county || "").toString();
+  const state = (a.state || "").toString();
+  return {
+    fips,
+    county, state,
+    label: county + ", " + state,
+    lower: (county + " " + state).toLowerCase(),
+    countyLower: county.toLowerCase(),
+    n_rows: a.n_rows || 0
+  };
+});
+
+const searchInput = document.getElementById("searchInput");
+const searchResults = document.getElementById("searchResults");
+let searchActiveIdx = -1;
+let searchMatches = [];
+
+function normalize(s) {
+  return s.toLowerCase().replace(/[,.]/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function runSearch(q) {
+  const qn = normalize(q);
+  if (!qn) { searchMatches = []; return; }
+  const tokens = qn.split(" ");
+  const scored = [];
+  for (const item of SEARCH_INDEX) {
+    const allMatch = tokens.every(t => item.lower.includes(t));
+    if (!allMatch) continue;
+    let score = 0;
+    if (item.countyLower === tokens[0]) score -= 1000;
+    else if (item.countyLower.startsWith(tokens[0])) score -= 500;
+    else if (item.countyLower.includes(tokens[0])) score -= 100;
+    score -= item.n_rows * 0.01;
+    scored.push({ item, score });
+  }
+  scored.sort((a, b) => a.score - b.score);
+  searchMatches = scored.slice(0, 10).map(x => x.item);
+}
+
+function renderSearch() {
+  if (searchMatches.length === 0) {
+    const q = searchInput.value.trim();
+    if (!q) { closeSearch(); return; }
+    searchResults.innerHTML = '<div class="empty-msg">No counties match "' + escapeHtml(q) + '"</div>';
+    searchResults.classList.add("open");
+    return;
+  }
+  searchResults.innerHTML = searchMatches.map((m, i) =>
+    '<div class="item' + (i === searchActiveIdx ? ' active' : '') + '" data-idx="' + i + '">' +
+      '<div><span class="name">' + escapeHtml(m.county) + '</span> <span class="state">' + escapeHtml(m.state) + '</span></div>' +
+      '<div class="meta">' + m.n_rows.toLocaleString() + (m.n_rows === 1 ? " project" : " projects") + '</div>' +
+    '</div>'
+  ).join("");
+  searchResults.classList.add("open");
+  Array.from(searchResults.querySelectorAll(".item")).forEach(el => {
+    el.addEventListener("mouseenter", () => {
+      searchActiveIdx = Number(el.dataset.idx);
+      Array.from(searchResults.querySelectorAll(".item")).forEach((n, i) => n.classList.toggle("active", i === searchActiveIdx));
+    });
+    el.addEventListener("click", () => pickSearchResult(Number(el.dataset.idx)));
+  });
+}
+
+function closeSearch() {
+  searchResults.classList.remove("open");
+  searchActiveIdx = -1;
+}
+
+function pickSearchResult(i) {
+  const m = searchMatches[i];
+  if (!m) return;
+  searchInput.value = m.label;
+  closeSearch();
+  selectCounty(m.fips, { highlight: true });
+}
+
+searchInput.addEventListener("input", () => {
+  runSearch(searchInput.value);
+  searchActiveIdx = searchMatches.length > 0 ? 0 : -1;
+  renderSearch();
+});
+searchInput.addEventListener("focus", () => {
+  if (searchInput.value.trim()) {
+    runSearch(searchInput.value);
+    renderSearch();
+  }
+});
+searchInput.addEventListener("keydown", e => {
+  if (e.key === "ArrowDown") {
+    e.preventDefault();
+    if (searchMatches.length === 0) return;
+    searchActiveIdx = (searchActiveIdx + 1) % searchMatches.length;
+    renderSearch();
+  } else if (e.key === "ArrowUp") {
+    e.preventDefault();
+    if (searchMatches.length === 0) return;
+    searchActiveIdx = (searchActiveIdx - 1 + searchMatches.length) % searchMatches.length;
+    renderSearch();
+  } else if (e.key === "Enter") {
+    e.preventDefault();
+    if (searchActiveIdx >= 0) pickSearchResult(searchActiveIdx);
+  } else if (e.key === "Escape") {
+    closeSearch();
+    searchInput.blur();
+  }
+});
+document.addEventListener("click", e => {
+  if (!e.target.closest(".search")) closeSearch();
+});
+</script>
+</body>
+</html>
