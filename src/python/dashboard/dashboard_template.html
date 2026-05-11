@@ -250,12 +250,91 @@
     margin-bottom: 14px;
   }
 
+  /* Top toolbar with tabs + status filter */
+  .toolbar {
+    display: flex; align-items: center; gap: 18px;
+    padding: 10px 16px;
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow-sm);
+    margin-bottom: 16px;
+    flex-wrap: wrap;
+  }
+  .tab-nav { display: inline-flex; gap: 2px; padding: 3px; background: var(--rule-soft); border-radius: 8px; }
+  .tab-btn {
+    padding: 6px 14px; font-size: 12.5px; font-weight: 500;
+    background: transparent; border: 0; color: var(--ink-soft);
+    border-radius: 6px; cursor: pointer;
+    transition: background var(--transition), color var(--transition);
+  }
+  .tab-btn:hover { color: var(--ink); background: rgba(255,255,255,0.5); }
+  .tab-btn.active { background: var(--surface); color: var(--ink); box-shadow: var(--shadow-sm); }
+  .toolbar .divider { width: 1px; height: 22px; background: var(--rule); }
+  .status-filter { display: inline-flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .status-filter > .status-label {
+    font-size: 12.5px; color: var(--ink-soft);
+  }
+  .status-options { display: inline-flex; gap: 2px; padding: 3px; background: var(--rule-soft); border-radius: 8px; }
+  .status-options label {
+    padding: 5px 11px; font-size: 12px; color: var(--ink-soft);
+    border-radius: 6px; cursor: pointer; user-select: none;
+    transition: background var(--transition), color var(--transition);
+    font-variant-numeric: tabular-nums;
+  }
+  .status-options label:hover { color: var(--ink); }
+  .status-options input[type=radio] { display: none; }
+  .status-options input[type=radio]:checked + span { /* nothing */ }
+  .status-options label.checked { background: var(--surface); color: var(--ink); box-shadow: var(--shadow-sm); font-weight: 500; }
+  .status-count { color: var(--ink-muted); margin-left: 4px; font-family: "Geist Mono", monospace; font-size: 11px; }
+
+  /* Tab panels */
+  .tab-panel { display: none; }
+  .tab-panel.active { display: block; }
+
+  /* Trends layout */
+  .trends-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+  }
+  .chart-card {
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-sm);
+    padding: 18px 20px 14px;
+  }
+  .chart-card.wide { grid-column: 1 / -1; }
+  .chart-card h3 {
+    font-family: "Geist", sans-serif;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--ink);
+    margin: 0 0 2px 0;
+    letter-spacing: -0.002em;
+  }
+  .chart-card .chart-sub {
+    font-size: 11.5px;
+    color: var(--ink-muted);
+    margin-bottom: 10px;
+  }
+  .chart-box { width: 100%; height: 320px; }
+
+  @media (max-width: 880px) {
+    .trends-grid { grid-template-columns: 1fr; }
+    .chart-card.wide { grid-column: auto; }
+  }
+
   /* Subtle page-load animation */
   @keyframes rise { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
-  header, .metric-bar, #map, #detail { animation: rise 420ms cubic-bezier(0.22, 0.61, 0.36, 1) both; }
-  .metric-bar { animation-delay: 60ms; }
-  #map { animation-delay: 120ms; }
-  #detail { animation-delay: 180ms; }
+  header, .toolbar, .metric-bar, #map, #detail, .chart-card { animation: rise 420ms cubic-bezier(0.22, 0.61, 0.36, 1) both; }
+  .toolbar { animation-delay: 40ms; }
+  .metric-bar { animation-delay: 80ms; }
+  #map { animation-delay: 140ms; }
+  #detail { animation-delay: 200ms; }
+  .chart-card:nth-child(2) { animation-delay: 80ms; }
+  .chart-card:nth-child(3) { animation-delay: 140ms; }
 </style>
 </head>
 <body>
@@ -267,59 +346,100 @@
     </div>
   </header>
 
-  <div class="metric-bar">
-    <div class="search">
-      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true"><circle cx="7" cy="7" r="4.5" stroke="currentColor" stroke-width="1.5"/><path d="M13.5 13.5l-3-3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
-      <input type="text" id="searchInput" placeholder="Search county, state..." autocomplete="off" spellcheck="false">
-      <div class="search-results" id="searchResults" role="listbox"></div>
+  <div class="toolbar">
+    <div class="tab-nav" role="tablist">
+      <button class="tab-btn active" data-tab="map" role="tab" aria-selected="true">Map</button>
+      <button class="tab-btn" data-tab="trends" role="tab" aria-selected="false">Trends</button>
     </div>
     <div class="divider"></div>
-    <label>Color by
-      <select id="metricSel">
-        <option value="n_rows">Project count</option>
-        <option value="avg_time_in_queue">Avg time in queue</option>
-        <option value="total_mw">Total MW</option>
-      </select>
-    </label>
-    <span class="coverage" id="coverageNote"></span>
+    <div class="status-filter">
+      <span class="status-label">Status</span>
+      <div class="status-options" id="statusOptions" role="radiogroup" aria-label="Filter by project status"></div>
+    </div>
   </div>
 
-  <div id="map"></div>
-
-  <div id="detail">
-    <div class="detail-head">
-      <div class="detail-head-text">
-        <h2 id="detailTitle">Click a county on the map</h2>
-        <div id="detailMeta"></div>
+  <div id="mapView" class="tab-panel active" role="tabpanel">
+    <div class="metric-bar">
+      <div class="search">
+        <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true"><circle cx="7" cy="7" r="4.5" stroke="currentColor" stroke-width="1.5"/><path d="M13.5 13.5l-3-3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+        <input type="text" id="searchInput" placeholder="Search county, state..." autocomplete="off" spellcheck="false">
+        <div class="search-results" id="searchResults" role="listbox"></div>
       </div>
-      <button class="primary" id="downloadBtn" disabled>
-        <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M8 2v8m0 0l-3-3m3 3l3-3M3 13h10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-        <span id="downloadLabel">Download CSV</span>
-      </button>
+      <div class="divider"></div>
+      <label>Color by
+        <select id="metricSel">
+          <option value="n_rows">Project count</option>
+          <option value="avg_time_in_queue">Avg time in queue</option>
+          <option value="total_mw">Total MW</option>
+        </select>
+      </label>
+      <span class="coverage" id="coverageNote"></span>
     </div>
-    <div class="controls">
-      <button id="colToggleBtn">Columns</button>
-      <input type="text" id="filter" placeholder="Filter rows...">
-      <button id="resetBtn">Reset</button>
-      <span class="row-count" id="rowCount"></span>
+
+    <div id="map"></div>
+
+    <div id="detail">
+      <div class="detail-head">
+        <div class="detail-head-text">
+          <h2 id="detailTitle">Click a county on the map</h2>
+          <div id="detailMeta"></div>
+        </div>
+        <button class="primary" id="downloadBtn" disabled>
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M8 2v8m0 0l-3-3m3 3l3-3M3 13h10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <span id="downloadLabel">Download CSV</span>
+        </button>
+      </div>
+      <div class="controls">
+        <button id="colToggleBtn">Columns</button>
+        <input type="text" id="filter" placeholder="Filter rows...">
+        <button id="resetBtn">Reset</button>
+        <span class="row-count" id="rowCount"></span>
+      </div>
+      <div id="colTogglePanel"></div>
+      <div class="table-wrap"><table id="tbl"><thead></thead><tbody></tbody></table></div>
     </div>
-    <div id="colTogglePanel"></div>
-    <div class="table-wrap"><table id="tbl"><thead></thead><tbody></tbody></table></div>
+  </div>
+
+  <div id="trendsView" class="tab-panel" role="tabpanel">
+    <div class="trends-grid">
+      <div class="chart-card wide">
+        <h3 id="chartYearTitle">Projects per year</h3>
+        <div class="chart-sub" id="chartYearSub">Based on the unified <code style="font-family:'Geist Mono',monospace;font-size:11px;">effective_year</code> field. Rows missing a year are excluded.</div>
+        <div class="chart-box" id="chartYear"></div>
+      </div>
+      <div class="chart-card">
+        <h3>Status breakdown</h3>
+        <div class="chart-sub">Total project rows by <code style="font-family:'Geist Mono',monospace;font-size:11px;">status_group</code>. Doesn't react to the status filter, which is the same axis.</div>
+        <div class="chart-box" id="chartStatus"></div>
+      </div>
+      <div class="chart-card">
+        <h3 id="chartFuelTitle">By technology / fuel</h3>
+        <div class="chart-sub" id="chartFuelSub">Collapsed buckets from <code style="font-family:'Geist Mono',monospace;font-size:11px;">lbnl_type_clean</code> with EIA fallback.</div>
+        <div class="chart-box" id="chartFuel"></div>
+      </div>
+    </div>
   </div>
 </div>
 
 <script>
 const AGG = __AGG__;
+const AGG_BY_STATUS = __AGG_BY_STATUS__;
+const CHARTS = __CHARTS__;
+const STATUS_KEYS = __STATUS_KEYS__;
+const STATUS_LABELS = __STATUS_LABELS__;
 const ROWS = __ROWS__;
 const COLS = __COLS__;
 const LABELS = __LABELS__;
 const GEO = __GEO__;
 
-const fipsList = Object.keys(AGG);
-const customData = fipsList.map(f => {
-  const a = AGG[f];
-  return [a.county, a.state, a.isos, a.n_rows, a.total_mw, a.avg_time_in_queue];
-});
+const STATUS_COL = COLS.indexOf("status_group");
+
+let currentStatus = "all";
+let currentTab = "map";
+let chartsRendered = false;
+
+function currentAgg() { return AGG_BY_STATUS[currentStatus] || {}; }
+function fipsListForCurrent() { return Object.keys(currentAgg()); }
 
 const METRIC_META = {
   n_rows: { label: "Projects", fmt: v => v == null ? "-" : v.toLocaleString() },
@@ -343,10 +463,12 @@ function percentile(arr, p) {
 }
 
 function buildTraces(metric) {
-  const vals = fipsList.map(f => AGG[f][metric]);
+  const agg = currentAgg();
+  const fipsList = Object.keys(agg);
+  const vals = fipsList.map(f => agg[f][metric]);
   const hasVal = fipsList.filter((f,i) => vals[i] != null);
   const noVal = fipsList.filter((f,i) => vals[i] == null);
-  const zVals = hasVal.map(f => AGG[f][metric]);
+  const zVals = hasVal.map(f => agg[f][metric]);
 
   const zmax = zVals.length ? percentile(zVals.filter(v => v > 0), 0.95) : 1;
   const zmin = 0;
@@ -360,7 +482,7 @@ function buildTraces(metric) {
     colorscale: [[0, "#e8e4da"], [1, "#e8e4da"]],
     showscale: false,
     marker: { line: { width: 0.35, color: "#b8b3a5" } },
-    customdata: noVal.map(f => { const a = AGG[f]; return [a.county, a.state, a.isos, a.n_rows, a.total_mw, a.avg_time_in_queue]; }),
+    customdata: noVal.map(f => { const a = agg[f]; return [a.county, a.state, a.isos, a.n_rows, a.total_mw, a.avg_time_in_queue]; }),
     hovertemplate:
       "<b>%{customdata[0]}, %{customdata[1]}</b><br>" +
       "ISO: %{customdata[2]}<br>" +
@@ -391,7 +513,7 @@ function buildTraces(metric) {
       xpad: 0,
       y: 0.5
     },
-    customdata: hasVal.map(f => { const a = AGG[f]; return [a.county, a.state, a.isos, a.n_rows, a.total_mw, a.avg_time_in_queue]; }),
+    customdata: hasVal.map(f => { const a = agg[f]; return [a.county, a.state, a.isos, a.n_rows, a.total_mw, a.avg_time_in_queue]; }),
     hovertemplate:
       "<b>%{customdata[0]}, %{customdata[1]}</b><br>" +
       "ISO: %{customdata[2]}<br>" +
@@ -449,8 +571,9 @@ function renderMap(metric) {
   const hl = buildHighlightTrace();
   if (hl) traces.push(hl);
   Plotly.react("map", traces, layout, { responsive: true, displayModeBar: false });
+  const statusBit = currentStatus === "all" ? "" : "  \u00b7  filter: " + STATUS_LABELS[currentStatus];
   document.getElementById("coverageNote").textContent =
-    hasVal.toLocaleString() + " counties colored  \u00b7  " + noVal.toLocaleString() + " grey (no value)";
+    hasVal.toLocaleString() + " counties colored  \u00b7  " + noVal.toLocaleString() + " grey (no value)" + statusBit;
   attachClickHandler();
 }
 renderMap("n_rows");
@@ -490,9 +613,10 @@ function downloadCurrent() {
   const csv = toCSV(COLS, currentRows);
   const blob = new Blob(["\ufeff" + csv], { type: "text/csv;charset=utf-8" });
   const url = URL.createObjectURL(blob);
+  const statusTag = currentStatus === "all" ? "" : "_" + currentStatus;
   const link = document.createElement("a");
   link.href = url;
-  link.download = "queue_" + slug(a && a.county) + "_" + (a && a.state || "us") + "_" + currentFips + ".csv";
+  link.download = "queue_" + slug(a && a.county) + "_" + (a && a.state || "us") + "_" + currentFips + statusTag + ".csv";
   document.body.appendChild(link);
   link.click();
   link.remove();
@@ -557,14 +681,23 @@ function pill(k, v) {
   return '<span class="pill"><span class="k">' + escapeHtml(k) + '</span><span class="v">' + escapeHtml(v) + '</span></span>';
 }
 
+function rowsForFips(fips) {
+  const raw = ROWS[fips] || [];
+  if (currentStatus === "all" || STATUS_COL < 0) return raw;
+  return raw.filter(r => r[STATUS_COL] === currentStatus);
+}
+
 function selectCounty(fips, opts) {
   opts = opts || {};
   currentFips = fips;
-  currentRows = ROWS[fips] || [];
-  const a = AGG[fips];
-  const label = a ? (a.county + ", " + a.state) : (LABELS[fips] || fips);
+  currentRows = rowsForFips(fips);
+  const filteredA = currentAgg()[fips];
+  const globalA = AGG[fips];
+  const labelSource = globalA || filteredA;
+  const label = labelSource ? (labelSource.county + ", " + labelSource.state) : (LABELS[fips] || fips);
   titleEl.textContent = label + ".";
-  if (a) {
+  if (filteredA) {
+    const a = filteredA;
     const parts = [
       pill("Projects", Number(a.n_rows).toLocaleString()),
       pill("Total MW", a.total_mw == null ? "\u2014" : Number(a.total_mw).toLocaleString(undefined, {maximumFractionDigits: 1})),
@@ -572,7 +705,13 @@ function selectCounty(fips, opts) {
       pill("ISO", a.isos || "\u2014"),
       pill("FIPS", fips)
     ];
+    if (currentStatus !== "all") parts.unshift(pill("Filter", STATUS_LABELS[currentStatus]));
     metaEl.innerHTML = parts.join("");
+  } else if (globalA && currentStatus !== "all") {
+    metaEl.innerHTML = pill("Filter", STATUS_LABELS[currentStatus]) +
+      pill("Projects in filter", "0") +
+      pill("Total projects (all)", Number(globalA.n_rows).toLocaleString()) +
+      pill("FIPS", fips);
   } else {
     metaEl.textContent = "No aggregate stats available";
   }
@@ -602,19 +741,24 @@ function attachClickHandler() {
   });
 }
 
-const SEARCH_INDEX = Object.keys(AGG).map(fips => {
-  const a = AGG[fips];
-  const county = (a.county || "").toString();
-  const state = (a.state || "").toString();
-  return {
-    fips,
-    county, state,
-    label: county + ", " + state,
-    lower: (county + " " + state).toLowerCase(),
-    countyLower: county.toLowerCase(),
-    n_rows: a.n_rows || 0
-  };
-});
+let SEARCH_INDEX = [];
+function rebuildSearchIndex() {
+  const agg = currentAgg();
+  SEARCH_INDEX = Object.keys(agg).map(fips => {
+    const a = agg[fips];
+    const county = (a.county || "").toString();
+    const state = (a.state || "").toString();
+    return {
+      fips,
+      county, state,
+      label: county + ", " + state,
+      lower: (county + " " + state).toLowerCase(),
+      countyLower: county.toLowerCase(),
+      n_rows: a.n_rows || 0
+    };
+  });
+}
+rebuildSearchIndex();
 
 const searchInput = document.getElementById("searchInput");
 const searchResults = document.getElementById("searchResults");
@@ -714,6 +858,199 @@ searchInput.addEventListener("keydown", e => {
 document.addEventListener("click", e => {
   if (!e.target.closest(".search")) closeSearch();
 });
+
+// ---------------------------------------------------------------------------
+// Status filter (radio segmented control)
+// ---------------------------------------------------------------------------
+
+function buildStatusFilter() {
+  const host = document.getElementById("statusOptions");
+  const keys = ["all"].concat(STATUS_KEYS);
+  const counts = {};
+  // Count rows per status from the canonical CHARTS payload.
+  // status_counts is keyed by display label, so we re-derive from AGG_BY_STATUS sizes.
+  for (const k of keys) {
+    if (k === "all") {
+      counts[k] = Object.values(AGG).reduce((s, a) => s + (a.n_rows || 0), 0);
+    } else {
+      const m = AGG_BY_STATUS[k] || {};
+      counts[k] = Object.values(m).reduce((s, a) => s + (a.n_rows || 0), 0);
+    }
+  }
+  host.innerHTML = keys.map(k => {
+    const label = STATUS_LABELS[k] || k;
+    const n = counts[k];
+    const checked = k === currentStatus ? " checked" : "";
+    const cls = k === currentStatus ? " checked" : "";
+    return '<label class="status-opt' + cls + '" data-key="' + k + '">' +
+      '<input type="radio" name="statusFilter" value="' + k + '"' + checked + '>' +
+      '<span>' + escapeHtml(label) + ' <span class="status-count">' + n.toLocaleString() + '</span></span>' +
+      '</label>';
+  }).join("");
+  Array.from(host.querySelectorAll("label")).forEach(el => {
+    el.addEventListener("click", () => {
+      const key = el.dataset.key;
+      if (key === currentStatus) return;
+      // Update visual state immediately
+      Array.from(host.querySelectorAll("label")).forEach(n => n.classList.toggle("checked", n.dataset.key === key));
+      const radio = el.querySelector("input");
+      if (radio) radio.checked = true;
+      applyStatusFilter(key);
+    });
+  });
+}
+
+function applyStatusFilter(key) {
+  currentStatus = key;
+  rebuildSearchIndex();
+  renderMap(currentMetric);
+  if (currentFips != null) selectCounty(currentFips, { highlight: false });
+  if (currentTab === "trends") {
+    renderCharts();
+  } else {
+    chartsRendered = false; // mark stale so they re-render when user switches in
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Tabs
+// ---------------------------------------------------------------------------
+
+function switchTab(name) {
+  if (currentTab === name) return;
+  currentTab = name;
+  document.querySelectorAll(".tab-btn").forEach(b => {
+    const isActive = b.dataset.tab === name;
+    b.classList.toggle("active", isActive);
+    b.setAttribute("aria-selected", isActive ? "true" : "false");
+  });
+  document.querySelectorAll(".tab-panel").forEach(p => {
+    p.classList.toggle("active", p.id === (name + "View"));
+  });
+  if (name === "trends" && !chartsRendered) renderCharts();
+  if (name === "map") {
+    // Plotly needs a resize cue after the container becomes visible.
+    const mapEl = document.getElementById("map");
+    if (mapEl && mapEl.offsetParent != null) Plotly.Plots.resize(mapEl);
+  }
+}
+document.querySelectorAll(".tab-btn").forEach(b => {
+  b.addEventListener("click", () => switchTab(b.dataset.tab));
+});
+
+// ---------------------------------------------------------------------------
+// Charts (Trends tab)
+// ---------------------------------------------------------------------------
+
+const CHART_LAYOUT_BASE = {
+  paper_bgcolor: "rgba(0,0,0,0)",
+  plot_bgcolor: "rgba(0,0,0,0)",
+  margin: { l: 56, r: 16, t: 6, b: 64 },
+  font: { family: "Geist, sans-serif", size: 12, color: "#1c1b19" },
+  hoverlabel: { bgcolor: "#1c1b19", bordercolor: "#1c1b19", font: { family: "Geist, sans-serif", color: "#faf8f4", size: 12 } },
+  showlegend: false,
+  xaxis: { gridcolor: "rgba(0,0,0,0)", linecolor: "#d3cec1", tickfont: { family: "Geist Mono, monospace", size: 11, color: "#5a564f" } },
+  yaxis: { gridcolor: "#f3efe7", linecolor: "rgba(0,0,0,0)", tickfont: { family: "Geist Mono, monospace", size: 11, color: "#5a564f" } },
+};
+
+function chartConfig() { return { responsive: true, displayModeBar: false }; }
+
+function renderStatusChart() {
+  const sc = CHARTS.status_counts || {};
+  // Preserve the canonical order (completed, active, withdrawn, eia_only).
+  const orderedKeys = STATUS_KEYS.map(k => STATUS_LABELS[k]).filter(l => l in sc);
+  // Append any unexpected keys at the end.
+  Object.keys(sc).forEach(l => { if (!orderedKeys.includes(l)) orderedKeys.push(l); });
+  const xs = orderedKeys;
+  const ys = orderedKeys.map(l => sc[l]);
+  const colors = xs.map(label => {
+    const selectedLabel = STATUS_LABELS[currentStatus];
+    if (currentStatus === "all" || label === selectedLabel) return "#2a4d43";
+    return "#c7d3cc";
+  });
+  const trace = {
+    type: "bar",
+    x: xs, y: ys,
+    marker: { color: colors, line: { color: "#2a4d43", width: 0 } },
+    hovertemplate: "<b>%{x}</b><br>%{y:,} projects<extra></extra>"
+  };
+  const layout = Object.assign({}, CHART_LAYOUT_BASE, {
+    xaxis: Object.assign({}, CHART_LAYOUT_BASE.xaxis, { tickangle: 0 }),
+    yaxis: Object.assign({}, CHART_LAYOUT_BASE.yaxis, { title: { text: "Projects", font: { family: "Geist Mono, monospace", size: 10, color: "#8a867e" } } })
+  });
+  Plotly.react("chartStatus", [trace], layout, chartConfig());
+}
+
+function renderFuelChart() {
+  const fbs = (CHARTS.fuel_by_status || {})[currentStatus] || {};
+  const items = Object.entries(fbs).sort((a, b) => b[1] - a[1]);
+  const TOP = 12;
+  const top = items.slice(0, TOP);
+  const restSum = items.slice(TOP).reduce((s, [, v]) => s + v, 0);
+  if (restSum > 0) top.push(["Other (rest)", restSum]);
+  // Horizontal bar so labels are readable.
+  const xs = top.map(x => x[1]).reverse();
+  const ys = top.map(x => x[0]).reverse();
+  const trace = {
+    type: "bar",
+    orientation: "h",
+    x: xs, y: ys,
+    marker: { color: "#2a4d43" },
+    hovertemplate: "<b>%{y}</b><br>%{x:,} projects<extra></extra>"
+  };
+  const layout = Object.assign({}, CHART_LAYOUT_BASE, {
+    margin: { l: 130, r: 16, t: 6, b: 36 },
+    xaxis: Object.assign({}, CHART_LAYOUT_BASE.xaxis, { title: { text: "Projects", font: { family: "Geist Mono, monospace", size: 10, color: "#8a867e" } } }),
+    yaxis: Object.assign({}, CHART_LAYOUT_BASE.yaxis, { automargin: true })
+  });
+  Plotly.react("chartFuel", [trace], layout, chartConfig());
+  const subEl = document.getElementById("chartFuelSub");
+  if (subEl) {
+    subEl.textContent = "Filter: " + STATUS_LABELS[currentStatus] +
+      "  ·  " + items.reduce((s, [, v]) => s + v, 0).toLocaleString() + " projects total.";
+  }
+}
+
+function renderYearChart() {
+  const ybs = (CHARTS.year_by_status || {})[currentStatus] || {};
+  const allYears = Object.keys(ybs).map(Number).sort((a, b) => a - b);
+  // Clip to 2000+ by default. Anything before 2000 is mostly old hydro and
+  // EIA-only operating plants — interesting but compresses the recent bars.
+  const CLIP_FROM = 2000;
+  const years = allYears.filter(y => y >= CLIP_FROM);
+  const hiddenBefore = allYears.filter(y => y < CLIP_FROM);
+  const hiddenCount = hiddenBefore.reduce((s, y) => s + ybs[String(y)], 0);
+
+  const trace = {
+    type: "bar",
+    x: years.map(String),
+    y: years.map(y => ybs[String(y)]),
+    marker: { color: "#2a4d43" },
+    hovertemplate: "<b>%{x}</b><br>%{y:,} projects<extra></extra>"
+  };
+  const layout = Object.assign({}, CHART_LAYOUT_BASE, {
+    xaxis: Object.assign({}, CHART_LAYOUT_BASE.xaxis, { type: "category", title: { text: "effective_year (" + CLIP_FROM + " onwards)", font: { family: "Geist Mono, monospace", size: 10, color: "#8a867e" } } }),
+    yaxis: Object.assign({}, CHART_LAYOUT_BASE.yaxis, { title: { text: "Projects", font: { family: "Geist Mono, monospace", size: 10, color: "#8a867e" } } })
+  });
+  Plotly.react("chartYear", [trace], layout, chartConfig());
+  const subEl = document.getElementById("chartYearSub");
+  if (subEl) {
+    const total = allYears.reduce((s, y) => s + ybs[String(y)], 0);
+    let txt = "Filter: " + STATUS_LABELS[currentStatus] +
+      "  ·  " + total.toLocaleString() + " rows with a recorded year. Rows missing effective_year are excluded.";
+    if (hiddenCount > 0) txt += "  " + hiddenCount.toLocaleString() + " rows from before " + CLIP_FROM + " are hidden for readability.";
+    subEl.textContent = txt;
+  }
+}
+
+function renderCharts() {
+  renderStatusChart();
+  renderFuelChart();
+  renderYearChart();
+  chartsRendered = true;
+}
+
+buildStatusFilter();
 </script>
 </body>
 </html>

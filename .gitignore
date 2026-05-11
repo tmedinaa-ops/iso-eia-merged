@@ -43,6 +43,11 @@ env/
 # Keep the dashboard HTML template (it is source, not a build artifact)
 !src/python/dashboard/dashboard_template.html
 
+# Keep the docs/ folder for GitHub Pages publication
+!docs/
+!docs/*.html
+!docs/*.md
+
 # Output artifacts from R Markdown
 *.pdf
 *.png

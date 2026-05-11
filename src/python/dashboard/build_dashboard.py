@@ -86,6 +86,65 @@ STRIP_WORDS = re.compile(
 ST_DOT = re.compile(r"\bSt\b(?!\.)", re.I)
 CITY_OF = re.compile(r"^City of\s+(.+)$", re.I)
 
+# --------------------------------------------------------------------------
+# Status filter + fuel normalization
+# --------------------------------------------------------------------------
+
+# The four real values of the `status_group` column in v7. Order here
+# controls the order of radio buttons in the UI.
+STATUS_KEYS = ["completed", "active", "withdrawn", "eia_only"]
+STATUS_LABELS = {
+    "all": "All projects",
+    "completed": "Completed",
+    "active": "Active",
+    "withdrawn": "Withdrawn",
+    "eia_only": "Operating (not in queue)",
+}
+
+
+def fuel_bucket(row: pd.Series) -> str:
+    """Collapse the merged dataset's many fuel/type labels into a small chart-
+    friendly bucket. Prefers `lbnl_type_clean` (already normalized) and falls
+    back to `type1`/`fuel1` for rows that came from EIA only."""
+    text = None
+    for col in ("lbnl_type_clean", "type1", "fuel1"):
+        v = row.get(col)
+        if isinstance(v, str) and v.strip():
+            text = v.strip().lower()
+            break
+    if not text:
+        return "Unknown"
+    if "solar" in text and ("battery" in text or "storage" in text):
+        return "Solar+Battery"
+    if "solar" in text or text in {"sun", "photovoltaic"}:
+        return "Solar"
+    if "wind" in text or text == "wnd":
+        return "Wind"
+    if "battery" in text or text in {"storage", "es", "mwh"}:
+        return "Battery"
+    if "nuclear" in text:
+        return "Nuclear"
+    if "landfill" in text or text == "lfg":
+        return "Landfill Gas"
+    if "biomass" in text or "biogas" in text or text in {"wds", "ob", "msw"}:
+        return "Biomass"
+    if "geothermal" in text or text == "geo":
+        return "Geothermal"
+    if "coal" in text or text in {"bit", "sub", "lig", "ant"}:
+        return "Coal"
+    if "hydro" in text or text == "wat":
+        return "Hydro"
+    if (
+        "oil" in text
+        or "petroleum" in text
+        or "diesel" in text
+        or text in {"dfo", "rfo", "jf", "ker"}
+    ):
+        return "Oil"
+    if "gas" in text or text == "ng":
+        return "Gas"
+    return "Other"
+
 
 def _normalize(county: Any, state: Any) -> tuple[str | None, str | None]:
     if pd.isna(county) or pd.isna(state):
@@ -201,10 +260,17 @@ def _clean_nan(v: Any) -> Any:
     return v
 
 
+def _agg_to_dict(agg_df: pd.DataFrame) -> dict:
+    a = agg_df.copy()
+    a["fips"] = a["fips"].astype(str).str.zfill(5)
+    return _clean_nan(a.set_index("fips").to_dict(orient="index"))
+
+
 def build_payloads(df_matched: pd.DataFrame, agg: pd.DataFrame, geo: dict) -> dict:
-    cols = [c for c in df_matched.columns if c != "fips"]
     df_matched = df_matched.copy()
     df_matched["fips"] = df_matched["fips"].astype(str).str.zfill(5)
+
+    cols = [c for c in df_matched.columns if c != "fips"]
 
     rows_by_fips: dict[str, list[list]] = {}
     for fips_val, grp in df_matched.groupby("fips"):
@@ -212,9 +278,19 @@ def build_payloads(df_matched: pd.DataFrame, agg: pd.DataFrame, geo: dict) -> di
             [_to_cell(row[c]) for c in cols] for _, row in grp.iterrows()
         ]
 
-    agg = agg.copy()
-    agg["fips"] = agg["fips"].astype(str).str.zfill(5)
-    agg_dict = _clean_nan(agg.set_index("fips").to_dict(orient="index"))
+    agg_dict = _agg_to_dict(agg)
+
+    # Per-status aggregates so the map can recolor without re-iterating rows.
+    agg_by_status: dict[str, dict] = {"all": agg_dict}
+    for sv in STATUS_KEYS:
+        sub = df_matched[df_matched["status_group"] == sv]
+        if len(sub) == 0:
+            agg_by_status[sv] = {}
+            continue
+        agg_by_status[sv] = _agg_to_dict(compute_agg(sub))
+
+    # Chart payloads. Pre-aggregated in Python so the JS just renders bars.
+    charts = compute_chart_data(df_matched)
 
     county_labels: dict[str, str] = {}
     for feat in geo.get("features", []):
@@ -227,10 +303,49 @@ def build_payloads(df_matched: pd.DataFrame, agg: pd.DataFrame, geo: dict) -> di
 
     return {
         "AGG": agg_dict,
+        "AGG_BY_STATUS": agg_by_status,
+        "CHARTS": charts,
+        "STATUS_KEYS": STATUS_KEYS,
+        "STATUS_LABELS": STATUS_LABELS,
         "ROWS": rows_by_fips,
         "COLS": cols,
         "LABELS": county_labels,
         "GEO": geo,
+    }
+
+
+def compute_chart_data(df: pd.DataFrame) -> dict:
+    """Return chart-ready dicts keyed by status filter.
+
+    - `status_counts` is a fixed bar chart of the four status_group buckets
+      (it doesn't change with the filter, since the filter IS status).
+    - `fuel_by_status[s]` and `year_by_status[s]` give the per-status fuel
+      and per-year counts. `s` is one of "all", "completed", "active",
+      "withdrawn", "eia_only".
+    """
+    d = df.copy()
+    d["_fuel"] = d.apply(fuel_bucket, axis=1)
+    d["_year"] = pd.to_numeric(d.get("effective_year"), errors="coerce")
+
+    sc = d["status_group"].value_counts(dropna=False)
+    status_counts = {
+        STATUS_LABELS.get(k if isinstance(k, str) else "unknown", str(k)): int(v)
+        for k, v in sc.items()
+    }
+
+    fuel_by_status: dict[str, dict] = {}
+    year_by_status: dict[str, dict] = {}
+    for s in ["all"] + STATUS_KEYS:
+        sub = d if s == "all" else d[d["status_group"] == s]
+        fc = sub["_fuel"].value_counts(dropna=False)
+        fuel_by_status[s] = {str(k): int(v) for k, v in fc.items() if pd.notna(k)}
+        yc = sub.dropna(subset=["_year"]).groupby("_year").size()
+        year_by_status[s] = {str(int(k)): int(v) for k, v in yc.items()}
+
+    return {
+        "status_counts": status_counts,
+        "fuel_by_status": fuel_by_status,
+        "year_by_status": year_by_status,
     }
 
 
