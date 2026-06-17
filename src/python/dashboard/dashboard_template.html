@@ -342,7 +342,7 @@
   <header>
     <div class="title-wrap">
       <h1>Interconnection Queue, by county.</h1>
-      <div class="sub">Click a county to inspect every project from <code style="font-family:'Geist Mono',monospace;font-size:12.5px;color:var(--ink-soft);">ISO_EIA_Merged_v7</code>. Counties with projects but no value for the selected metric are shown in a soft grey.</div>
+      <div class="sub">Click a county to inspect every project from <code style="font-family:'Geist Mono',monospace;font-size:12.5px;color:var(--ink-soft);">ISO_EIA_Merged_v7</code>. Counties with projects but no value for the selected metric are shown in a soft grey. The <code style="font-family:'Geist Mono',monospace;font-size:12.5px;color:var(--ink-soft);">technology</code> column is a reconciled label derived from fuel, EIA, and ISO fields; the verbatim ISO <code style="font-family:'Geist Mono',monospace;font-size:12.5px;color:var(--ink-soft);">type1</code> remains available under "Columns".</div>
     </div>
   </header>
 
@@ -429,6 +429,7 @@ const STATUS_KEYS = __STATUS_KEYS__;
 const STATUS_LABELS = __STATUS_LABELS__;
 const ROWS = __ROWS__;
 const COLS = __COLS__;
+const HIDDEN = __HIDDEN__;
 const LABELS = __LABELS__;
 const GEO = __GEO__;
 
@@ -581,7 +582,9 @@ document.getElementById("metricSel").addEventListener("change", e => renderMap(e
 
 let currentFips = null;
 let currentRows = [];
-let visibleCols = new Set(COLS);
+const HIDDEN_SET = new Set(HIDDEN || []);
+function defaultVisibleCols() { return new Set(COLS.filter(c => !HIDDEN_SET.has(c))); }
+let visibleCols = defaultVisibleCols();
 
 const titleEl = document.getElementById("detailTitle");
 const metaEl = document.getElementById("detailMeta");
@@ -648,7 +651,7 @@ document.getElementById("colToggleBtn").addEventListener("click", () => {
 });
 document.getElementById("resetBtn").addEventListener("click", () => {
   filterEl.value = "";
-  visibleCols = new Set(COLS);
+  visibleCols = defaultVisibleCols();
   buildColPanel();
   render();
 });

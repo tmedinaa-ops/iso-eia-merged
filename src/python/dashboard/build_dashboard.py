@@ -146,6 +146,175 @@ def fuel_bucket(row: pd.Series) -> str:
     return "Other"
 
 
+# --------------------------------------------------------------------------
+# Reconciled technology label
+# --------------------------------------------------------------------------
+#
+# The raw `type1` column is copied verbatim from each ISO's queue file and is
+# not always internally consistent. CAISO in particular sometimes records a
+# prime mover (e.g. "Steam Turbine") in the Type field of a project whose
+# Fuel field correctly says "Solar" — so a solar PV plant can display as a
+# steam turbine. NYISO encodes fuel as single letters (S = Solar, W = Wind).
+# Some EIA fuzzy matches are also wrong (a solar project linked to a gas unit).
+#
+# `reconcile_technology` derives a single clean technology label per row
+# WITHOUT mutating the source columns. Priority:
+#   * eia_only rows  -> trust the EIA generator record (eia_technologies).
+#   * queue rows     -> trust the ISO's own type1/fuel1 consensus; fall back
+#                       to fuel1 when type1/fuel1 disagree (the type field is
+#                       where the upstream errors live); use EIA only as a
+#                       last resort so a bad fuzzy match cannot corrupt a row
+#                       whose type1 and fuel1 already agree.
+# Raw `type1` is preserved in the data and remains available in the dashboard
+# via the "Columns" toggle.
+
+# Exact-match decoder for EIA energy-source codes and ISO short codes
+# (keys are lowercased).
+TECH_CODE = {
+    "sun": "Solar", "s": "Solar", "pv": "Solar", "sol": "Solar",
+    "wnd": "Wind", "w": "Wind", "wt": "Wind",
+    "osw": "Offshore Wind",
+    "wat": "Hydro", "h": "Hydro", "hy": "Hydro",
+    "ps": "Pumped Storage",
+    "es": "Battery Storage", "bat": "Battery Storage", "mwh": "Battery Storage",
+    "ba": "Battery Storage",
+    "nuc": "Nuclear", "nu": "Nuclear",
+    "geo": "Geothermal",
+    "ng": "Natural Gas", "og": "Natural Gas", "pg": "Natural Gas",
+    "bfg": "Natural Gas", "sgp": "Natural Gas", "h2": "Natural Gas", "gas": "Natural Gas",
+    "cc": "Natural Gas (CC)", "ct": "Natural Gas (CT)", "gt": "Natural Gas (CT)",
+    "ctg": "Natural Gas (CT)",
+    "bit": "Coal", "sub": "Coal", "lig": "Coal", "ant": "Coal", "rc": "Coal",
+    "wc": "Coal", "sgc": "Coal", "pc": "Coal",
+    "dfo": "Oil", "rfo": "Oil", "ker": "Oil", "jf": "Oil", "oil": "Oil",
+    "lfg": "Landfill Gas",
+    "wds": "Biomass", "wdl": "Biomass", "obl": "Biomass", "obg": "Biomass",
+    "obs": "Biomass", "ab": "Biomass", "blq": "Biomass", "slw": "Biomass",
+    "wo": "Biomass", "msw": "Biomass", "tdf": "Biomass",
+    "fc": "Fuel Cell",
+}
+
+
+def _tech_txt(v: Any) -> str:
+    return v.strip().lower() if isinstance(v, str) and v.strip() else ""
+
+
+def tech_label(text: Any) -> str | None:
+    """Map one free-text / coded type or fuel string to a clean technology
+    label, or None if it can't be classified (e.g. a bare prime mover like
+    "Steam Turbine", which is fuel-ambiguous)."""
+    t = _tech_txt(text)
+    if not t:
+        return None
+    if t in TECH_CODE:
+        return TECH_CODE[t]
+    if "solar" in t and ("batt" in t or "storage" in t):
+        return "Solar + Storage"
+    if "wind" in t and ("batt" in t or "storage" in t):
+        return "Wind + Storage"
+    if "photovolt" in t:
+        return "Solar"
+    if "solar" in t and "thermal" in t:
+        return "Solar Thermal"
+    if "solar" in t:
+        return "Solar"
+    if "offshore" in t and "wind" in t:
+        return "Offshore Wind"
+    if "wind" in t:
+        return "Wind"
+    if "pumped" in t:
+        return "Pumped Storage"
+    if "batt" in t or "storage" in t:
+        return "Battery Storage"
+    if "nuclear" in t:
+        return "Nuclear"
+    if "geothermal" in t:
+        return "Geothermal"
+    if "landfill" in t:
+        return "Landfill Gas"
+    if "biomass" in t or "biogas" in t or "wood" in t or "waste" in t:
+        return "Biomass"
+    if "coal" in t:
+        return "Coal"
+    if "hydro" in t or "water" in t:
+        return "Hydro"
+    if "petroleum" in t or "diesel" in t or "oil" in t:
+        return "Oil"
+    if "combined cycle" in t:
+        return "Natural Gas (CC)"
+    if "combustion" in t or "gas turbine" in t:
+        return "Natural Gas (CT)"
+    if "reciprocating" in t or "internal combustion" in t:
+        return "Natural Gas (RICE)"
+    if "cogen" in t:
+        return "Cogeneration"
+    if "fuel cell" in t:
+        return "Fuel Cell"
+    if "steam" in t:
+        return None  # bare prime mover: let the fuel field decide
+    if "gas" in t:
+        return "Natural Gas"
+    return None
+
+
+def tech_family(label: str | None) -> str:
+    """Collapse a clean technology label into a coarse family for the
+    type1/fuel1 consensus check."""
+    l = (label or "").lower()
+    if "solar" in l:
+        return "solar"
+    if "wind" in l:
+        return "wind"
+    if "pumped" in l:
+        return "pumped"
+    if "storage" in l or "batt" in l:
+        return "storage"
+    if "nuclear" in l:
+        return "nuclear"
+    if "geotherm" in l:
+        return "geo"
+    if "hydro" in l:
+        return "hydro"
+    if "landfill" in l or "biomass" in l:
+        return "bio"
+    if "coal" in l:
+        return "coal"
+    if "oil" in l:
+        return "oil"
+    if "gas" in l or "cogen" in l:
+        return "gas"
+    if "fuel cell" in l:
+        return "fuelcell"
+    return "other"
+
+
+def reconcile_technology(row: pd.Series) -> str:
+    """Derived, internally-consistent technology label. See module note above.
+    Does not mutate type1/fuel1; those stay verbatim in the data."""
+    src = row.get("source")
+    eia = tech_label(row.get("eia_technologies"))
+    fuel = tech_label(row.get("fuel1"))
+    typ = tech_label(row.get("type1"))
+    lbnl = tech_label(row.get("lbnl_type_clean"))
+
+    # EIA-only rows are EIA generator records, not fuzzy matches -> authoritative.
+    if src == "eia_only":
+        return eia or fuel or lbnl or "Other"
+
+    # Queue rows: pumped storage = hydro fuel + a storage/pumped type field.
+    t1 = _tech_txt(row.get("type1"))
+    if fuel == "Hydro" and ("pump" in t1 or "storage" in t1):
+        return "Pumped Storage"
+    # type1 and fuel1 agree on a family -> use that (prefer the more specific
+    # type label); EIA is ignored here so a bad fuzzy match can't override the
+    # ISO's own internal consensus.
+    if typ and fuel and tech_family(typ) == tech_family(fuel):
+        return typ or fuel
+    # Otherwise prefer fuel1 (the type field carries the upstream errors),
+    # then type1, then the cleaned LBNL label, then EIA as a last resort.
+    return fuel or typ or lbnl or eia or "Other"
+
+
 def _normalize(county: Any, state: Any) -> tuple[str | None, str | None]:
     if pd.isna(county) or pd.isna(state):
         return None, None
@@ -270,6 +439,17 @@ def build_payloads(df_matched: pd.DataFrame, agg: pd.DataFrame, geo: dict) -> di
     df_matched = df_matched.copy()
     df_matched["fips"] = df_matched["fips"].astype(str).str.zfill(5)
 
+    # Derived technology label, inserted right after the raw type1 column.
+    # type1 is left untouched and is hidden by default in the table (see
+    # DEFAULT_HIDDEN_COLS) but stays available via the Columns toggle.
+    tech = df_matched.apply(reconcile_technology, axis=1)
+    if "technology" in df_matched.columns:
+        df_matched["technology"] = tech
+    elif "type1" in df_matched.columns:
+        df_matched.insert(df_matched.columns.get_loc("type1") + 1, "technology", tech)
+    else:
+        df_matched["technology"] = tech
+
     cols = [c for c in df_matched.columns if c != "fips"]
 
     rows_by_fips: dict[str, list[list]] = {}
@@ -301,6 +481,10 @@ def build_payloads(df_matched: pd.DataFrame, agg: pd.DataFrame, geo: dict) -> di
                 f"{props.get('NAME', '')}, {props.get('STATE', '')}"
             )
 
+    # Columns hidden by default in the table (still toggleable via Columns).
+    # Raw type1 is hidden in favour of the reconciled `technology` column.
+    default_hidden = [c for c in ("type1",) if c in cols]
+
     return {
         "AGG": agg_dict,
         "AGG_BY_STATUS": agg_by_status,
@@ -309,6 +493,7 @@ def build_payloads(df_matched: pd.DataFrame, agg: pd.DataFrame, geo: dict) -> di
         "STATUS_LABELS": STATUS_LABELS,
         "ROWS": rows_by_fips,
         "COLS": cols,
+        "HIDDEN": default_hidden,
         "LABELS": county_labels,
         "GEO": geo,
     }
